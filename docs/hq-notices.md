@@ -77,14 +77,17 @@ an implementation of atomic member consume-one.
 
 The single home of the public payload, field compatibility table, byte oracle
 and errors is the [shared notice contract](https://github.com/true-line/soul-contracts/blob/main/schemas/hq/v1/notices.md).
-The read path re-sanitizes restored records, omits storage/transport fields,
-and creates fixed external-untrusted provenance. It bounds canonical UTF-8
+The read path re-sanitizes restored records, verifies the sanitized source
+against its stored ingestion digest, omits storage/transport fields, and creates
+fixed external-untrusted provenance. It bounds canonical UTF-8
 source content to 64 KiB and its returned notice array to 512 KiB, stopping
 before an additional peek entry would exceed that array limit. A source notice
 above its limit refuses before mutation; content is never truncated to fit.
 HQ validates its actual complete correlated result against the pinned shared
 schema and full-result budget inside `prepareResult` before consumption. For
-read-only peek, HQ may trim trailing entries to fit that complete result.
+read-only peek, HQ trims trailing entries when needed and revalidates the
+complete result before returning it. The private comms array is not the public
+result record and does not contain correlation or wrapper fields.
 Callbacks are host-only, synchronous, side-effect-free validation; they must
 not open another store transaction while this one holds the store lock.
 
@@ -92,7 +95,8 @@ not open another store transaction while this one holds the store lock.
 
 Missing, invalid or out-of-scope repository metadata is neither returned nor
 consumed. No repository is inferred from the caller. Invalid restored content,
-identity/sequence metadata or wake classification also stays withheld. These
+identity/sequence metadata, missing or mismatched content digests, or wake
+classification also stays withheld. These
 records remain ready, retain their dedup evidence and count against the existing
 message/byte limits; queries never silently discard, repair or reassign them.
 Oversized restored content in the selected scope refuses with `frame_too_large`

@@ -1,6 +1,7 @@
 // HQ notice custody, including the crash windows around a durable commit and
 // the upstream acknowledgement. Real HQ storage is loaded at the SDK's pin.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -386,6 +387,7 @@ test('read-side sanitation preserves source fields and 256-character IDs while s
     await t.store.tx((tx) => {
       const key = `${HARNESS}:${id}`; const row = tx.get('notice_mailbox', key);
       Object.assign(row.notice, { lease: 'SECRET_CANARY', attempts: 1, lease_expires_at: 100, owner_directive: 'execute', channel_binding: 'SECRET_CANARY', unknown: 'SECRET_CANARY' });
+      row.notice = Object.fromEntries(Object.entries(row.notice).reverse());
       row.provenance = ['owner']; tx.put('notice_mailbox', key, row);
     });
     const [item] = await t.pump.peek(scope);
@@ -421,6 +423,37 @@ test('invalid restored content and metadata stay ready and never gain caller rep
   } finally { t.cleanup(); }
 });
 
+test('missing or stale restored digests stay ready until operator repair and preserve replay deduplication', async () => {
+  const t = batchSetup(() => [notice('missing_digest'), notice('wrong_digest'), notice('changed_content')]);
+  try {
+    await t.start();
+    const originals = await t.store.tx((tx) => tx.list('notice_mailbox'));
+    await t.store.tx((tx) => {
+      for (const [id, row] of tx.list('notice_mailbox')) {
+        if (row.message_id === 'missing_digest') delete row.content_digest;
+        if (row.message_id === 'wrong_digest') row.content_digest = '0'.repeat(64);
+        if (row.message_id === 'changed_content') row.notice.text = 'Restored content differs';
+        tx.put('notice_mailbox', id, row);
+      }
+    });
+    const before = readFileSync(join(t.home, 'store.json'), 'utf8'); const calls = t.calls.length;
+    assert.deepEqual(await t.pump.peek({ ...scope, count: 50 }), []);
+    assert.deepEqual(await t.pump.consumeOne(scope, (items) => assert.deepEqual(items, [])), []);
+    assert.equal(readFileSync(join(t.home, 'store.json'), 'utf8'), before);
+    assert.equal(t.calls.length, calls);
+    const retained = await t.pump.list(HARNESS);
+    assert.equal(retained.length, 3);
+    assert.ok(retained.every((row) => row.state === 'ready' && Object.hasOwn(row, 'notice')));
+    // Model an explicit operator restoring the independently saved records.
+    // Queries must neither repair them nor destroy this recovery opportunity.
+    await t.store.tx((tx) => { for (const [id, row] of originals) tx.put('notice_mailbox', id, row); });
+    assert.equal((await t.pump.peek({ ...scope, count: 50 })).length, 3);
+    assert.equal((await t.pump.consumeOne(scope, prepare))[0].message_id, 'missing_digest');
+    assert.deepEqual(await t.pump.pull(), { received: 3, committed: 0, duplicates: 3, acknowledged: 3 });
+    assert.deepEqual((await t.pump.peek({ ...scope, count: 50 })).map((row) => row.message_id), ['wrong_digest', 'changed_content']);
+  } finally { t.cleanup(); }
+});
+
 test('canonical source budget is inclusive and excludes new result metadata', async () => {
   const source = { id: 'boundary', repo: 'example/project', text: '' };
   source.text = 'x'.repeat(65536 - canonicalBytes(source).length);
@@ -439,7 +472,11 @@ test('oversize restored source is refused before preparation or mutation, measur
   try {
     await t.start();
     await t.store.tx((tx) => {
-      for (const [id, row] of tx.list('notice_mailbox')) { row.notice.text = 'λ'.repeat(32768); tx.put('notice_mailbox', id, row); }
+      for (const [id, row] of tx.list('notice_mailbox')) {
+        row.notice.text = 'λ'.repeat(32768);
+        row.content_digest = createHash('sha256').update(JSON.stringify(row.notice)).digest('hex');
+        tx.put('notice_mailbox', id, row);
+      }
     });
     const before = readFileSync(join(t.home, 'store.json'), 'utf8'); const calls = t.calls.length;
     const tooLarge = (e) => e instanceof HostError && e.code === 'frame_too_large' && !e.message.includes('λ');
