@@ -151,28 +151,22 @@ exception messages.
 
 ## Compatibility and evidence
 
-This storage slice does not activate the HQ-backed identity CLI/MCP alias.
-The legacy direct-upstream `take_inbox` path still requires the coordinated
-shim and service custody gate before migration. A lost response after a local
-consume commit may lose that caller handoff: do not automatically retry a
-destructive query, and do not claim acknowledged local delivery. Tombstones
-survive restart and prevent an upstream redelivery from resurrecting the
-consumed message within the retention horizon.
+The [v0.5.0 notice contract](https://github.com/true-line/soul-contracts/blob/b96239cc47571237f7064ddbcbd0edec8e365c6b/schemas/hq/v1/notices.md)
+is published. Each component exercises a different part of the handoff.
 
-Tracking: [agent-bot-comms #317](https://github.com/true-line/agent-bot-comms/issues/317).
-The shared source is reviewed at `60c540ea71a720148f6733afc7b29fa1ec255753`,
-but the candidate `v0.5.0` is not yet released. This change creates no tag,
-release, copied contract or fabricated consumer pin. Final integration against
-the verified published release remains required; see
-[service #216](https://github.com/true-line/agent-bot/issues/216).
-[HQ #13](https://github.com/true-line/agent-bot-hq/issues/13) remains the overall
-alias acceptance tracker.
+- [Comms mailbox](https://github.com/true-line/agent-bot-comms/commit/972fcbed06c8ff79bf60bd9129f5da54e22f5772):
+  scoped selection, durable consumption and restart against the SDK-pinned HQ store.
+  [Comms suite](https://github.com/true-line/agent-bot-comms/actions/runs/43691570025/job/132743176683)
+- [HQ default host](https://github.com/true-line/agent-bot-hq/commit/dd9480195881912c12c537f6ae49eb221ec18cbc):
+  real comms and the released contract corpus.
+  [HQ integration tests](https://github.com/true-line/agent-bot-hq/actions/runs/43793533198)
+- [Installed Identity MCP](https://github.com/true-line/agent-bot-identity/commit/843b4433f397d5a3cc746fdc6f9110b6687d9444):
+  SDK-pinned HQ, real Soul and comms, injected notice handling and schemas, fixture signer and upstream.
+  [Installed suite](https://github.com/true-line/agent-bot-identity/actions/runs/43808462724/job/133104594419)
 
-`tests/hq-notices.test.mjs` uses the real HQ store at the vendored SDK's pinned
-revision. It covers persistence failures, restart after custody and before
-ack, duplicate/content-conflict handling, caps, retention, late responses,
-revocation and retry. Local mailbox regressions cover scope filtering, reversed
-source timestamps and table iteration, read-only peek, concurrent consume,
-result validation before mutation, persistence rollback, restart/redelivery,
-retained invalid records and canonical byte limits. Existing broker tests
-continue to exercise real HQ admission and task commits over its member socket.
+[HQ #13](https://github.com/true-line/agent-bot-hq/issues/13#issuecomment-6927251608)
+records overall alias acceptance for one managed-cooperative Linux pilot. In a
+mixed-version rollout, grant the configured HQ exclusive upstream custody before
+switching a harness to the HQ-backed alias. A lost consume response can lose
+the caller's handoff. Never retry it automatically. Tombstones prevent upstream
+redelivery from resurrecting that message within the retention horizon.
