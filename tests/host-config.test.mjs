@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, readdirSync, writeFileSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { readHostConfig } from '../lib/host-config.mjs';
 import { brokerPaths, clientPaths } from '../lib/paths.mjs';
@@ -50,16 +49,18 @@ test('shared and log directories default per platform; state directories do not'
   assert.equal(readHostConfig({ XDG_STATE_HOME: '/xdg' }, '/example', 'darwin').sharedDir, '/Users/Shared/Public/agent-comms');
 });
 
-test('the source checkout starts a single-account broker on Linux without directory overrides', {
+test('npm link from a source checkout starts a single-account broker on Linux without directory overrides', {
   skip: process.platform !== 'linux', timeout: 20000,
 }, async (t) => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'ac-linux-home-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  const env = Object.fromEntries(Object.entries(process.env)
-    .filter(([key]) => !key.startsWith('AGENT_COMMS_') && key !== 'XDG_STATE_HOME'));
-  const bin = fileURLToPath(new URL('../bin/agent-comms.mjs', import.meta.url));
-  const child = spawn(process.execPath, [bin, 'broker', 'run', '--single-account'],
-    { cwd: home, env: { ...env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] });
+  const prefix = path.join(home, 'npm-prefix');
+  const env = { HOME: home, PATH: [path.dirname(process.execPath), process.env.PATH].join(path.delimiter) };
+  execFileSync('npm', ['link', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd: new URL('../', import.meta.url), env: { ...env, NPM_CONFIG_PREFIX: prefix }, timeout: 10000,
+  });
+  const child = spawn(path.join(prefix, 'bin', 'agent-comms'), ['broker', 'run', '--single-account'],
+    { cwd: home, env, stdio: ['ignore', 'ignore', 'pipe'] });
   t.after(() => child.kill('SIGKILL'));
   let stderr = '';
   child.stderr.setEncoding('utf8');
