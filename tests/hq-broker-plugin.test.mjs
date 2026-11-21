@@ -4,8 +4,11 @@
 // delivers as agent-bot-hq plan §4.9 specifies.
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
@@ -78,6 +81,46 @@ test('the plugin is agent-comms at its package version, needs hq-admission, and 
   assert.deepEqual({ ...plugin.requires }, { 'hq-admission': '^0.1.0' });
   const r = await checkPlugin(plugin, { deps: [admission()] });
   assert.ok(r.ok, JSON.stringify(r.results.filter((x) => !x.ok)));
+});
+
+test('the installed package loads under its exact HQ pin and passes SDK conformance', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-comms plugin '));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const build = fileURLToPath(new URL('../scripts/build-hq-plugin.mjs', import.meta.url));
+  const { treeDigest, loadPlugins } = await import(pathToFileURL(join(agentBotHq(), 'hq/plugins.mjs')));
+  const digests = [];
+  for (const name of ['first', 'second']) {
+    const stage = join(root, name);
+    mkdirSync(stage);
+    execFileSync(process.execPath, [build, stage]);
+    const installed = join(stage, pkg.name);
+    const digest = treeDigest(installed);
+    digests.push(digest);
+    assert.deepEqual(JSON.parse(readFileSync(join(installed, 'package.json'))), { name: pkg.name, version: pkg.version });
+    const options = { dir: stage, available: { 'hq-admission': admission().version } };
+    const unpinned = await loadPlugins(options);
+    assert.equal(unpinned.report[0].state, 'refused');
+    const pins = { plugins: [{ name: pkg.name, version: pkg.version, sha256: digest }] };
+    const pinned = await loadPlugins({ ...options, pins });
+    assert.equal(pinned.report[0].state, 'loaded');
+    assert.equal(pinned.report[0].dev, undefined);
+    const result = await checkPlugin(pinned.loaded[0].plugin, { deps: [admission()] });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.throws(() => execFileSync(process.execPath, [build, stage], { stdio: 'pipe' }), /destination already exists/);
+    assert.equal(treeDigest(installed), digest);
+  }
+  assert.equal(digests[0], digests[1]);
+
+  // The installed tree also contains the producer's runtime inputs.
+  const altered = join(root, 'first', pkg.name);
+  mkdirSync(join(altered, 'scripts'));
+  const alteredBuild = join(altered, 'scripts', 'build-hq-plugin.mjs');
+  copyFileSync(build, alteredBuild);
+  writeFileSync(join(altered, 'lib/vendor/agent-bot-sdk/README.md'), 'changed after vendoring');
+  const refused = join(root, 'refused');
+  mkdirSync(refused);
+  assert.throws(() => execFileSync(process.execPath, [alteredBuild, refused], { stdio: 'pipe' }), /vendored SDK digest mismatch/);
+  assert.deepEqual(readdirSync(refused), []);
 });
 
 test('it serves the broker, binds a connection, and delivers with the runtime ID alone', async () => {
