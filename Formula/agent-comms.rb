@@ -10,11 +10,11 @@
 # tag and version below together with every other version site.
 class AgentComms < Formula
   desc "Harness-independent agent communication for the qwts fleet"
-  homepage "https://github.com/qwts/agent-comms"
-  url "https://github.com/qwts/agent-comms.git",
+  homepage "https://github.com/true-line/agent-bot-comms"
+  url "https://github.com/true-line/agent-bot-comms.git",
       using: :git,
-      tag:   "v0.5.5"
-  version "0.5.5"
+      tag:   "v0.5.6"
+  version "0.5.6"
   license "MIT"
 
   depends_on "node"
