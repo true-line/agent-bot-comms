@@ -6,7 +6,7 @@
 // refused; T05 holds over the socket.
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -175,6 +175,9 @@ test('closing a connection drops its binding, including one that closes while it
 // on real accounts.)
 async function withAccounts(run) {
   const dir = mkdtempSync(join(tmpdir(), 'm-'));
+  // Darwin inherits the parent directory's group, including wheel in /private/tmp.
+  // Use this process's group so the simulated endpoints can retain their setgid bit.
+  if (process.platform === 'darwin') chownSync(dir, -1, process.getgid());
   chmodSync(dir, 0o755);
   const accounts = { hqm_a: 61001, hqm_b: 61002 };
   const gids = {};
