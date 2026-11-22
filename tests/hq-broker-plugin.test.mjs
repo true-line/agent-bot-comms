@@ -243,7 +243,7 @@ const bridgeProof = (nonce, epoch) => createHmac('sha256', Buffer.from(BRIDGE_KE
 // HQ owns this authority. The stand-in models a Machine-approved assignment,
 // current HQ epoch, one-use HMAC challenge and live receipt. Comms must only
 // hand it the actual connection and must never turn B into a member runtime.
-const bridgeAdmission = (log) => definePlugin({
+const bridgeAdmission = (log, { beforeChallenge, beforeBridgeBind } = {}) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     const challenges = new Map();
@@ -257,20 +257,22 @@ const bridgeAdmission = (log) => definePlugin({
     }
     return { provides: {
       async verifyBinding() { fail('caller_mismatch', 'B is not a member'); },
-      bridgeBindChallenge(input, { connection }) {
+      async bridgeBindChallenge(input, { connection }) {
         log.push(['challenge', connection]);
         if (!assigned(input, connection) || spent.has(input.start_id)) fail('caller_mismatch', 'wrong bridge assignment');
+        if (beforeChallenge) await beforeChallenge();
         const nonce = 'c'.repeat(64);
         challenges.set(connection, nonce);
         return { nonce, algorithm: 'hmac-sha256', context: BRIDGE_CONTEXT,
           hq_epoch: epoch, expires_at: '2026-11-21T20:00:00.000Z' };
       },
-      verifyBridgeBinding(input, { connection }) {
+      async verifyBridgeBinding(input, { connection }) {
         log.push(['bind', connection]);
         const nonce = challenges.get(connection);
         challenges.delete(connection);
         if (!nonce || !assigned(input, connection) || spent.has(input.start_id) ||
             input.proof !== bridgeProof(nonce, epoch)) fail('caller_mismatch', 'wrong bridge proof');
+        if (beforeBridgeBind) await beforeBridgeBind();
         spent.add(input.start_id);
         const bind_receipt = 'd'.repeat(64);
         live.set(connection, bind_receipt);
@@ -283,6 +285,7 @@ const bridgeAdmission = (log) => definePlugin({
         live.delete(connection);
       },
       liveBridgeReceipt: (connection) => live.get(connection),
+      bridgeChallengeActive: (connection) => challenges.has(connection),
     } };
   },
 });
@@ -342,6 +345,80 @@ test('plugin stop revokes every live B receipt', async () => {
   assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), 'd'.repeat(64));
   await host.stop();
   assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+});
+
+test('stop drains a verifier that installs a B receipt after the first revocation', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must wait for the late verifier');
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 1);
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+});
+
+test('stop drains a challenge that installs after the first revocation', async () => {
+  let entered, release;
+  const challenging = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeChallenge: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const refused = assert.rejects(challenge, code('host.invalid_request'));
+  await challenging;
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must wait for the late challenge');
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+  assert.equal(host.provided('hq-admission').bridgeChallengeActive('b_1'), false);
+});
+
+test('same-tick socket close fences a queued B challenge or bind before HQ runs', async () => {
+  for (const phase of ['challenge', 'bind']) {
+    const log = [];
+    const host = createTestHost({ plugins: [bridgeAdmission(log), brokerPlugin()] });
+    await host.start();
+    const first = phase === 'bind'
+      ? await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' }) : null;
+    const pending = phase === 'challenge'
+      ? host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' })
+      : host.brokerAccept(BRIDGE_BIND,
+        { ...BRIDGE_SCOPE, proof: bridgeProof(first.nonce, first.hq_epoch) }, { connection: 'b_1' });
+    const refused = assert.rejects(pending, code('host.invalid_request'));
+    await host.brokerClosed('b_1');
+    await refused;
+    assert.equal(log.filter(([kind]) => kind === (phase === 'challenge' ? 'challenge' : 'bind')).length,
+      0, `${phase}: HQ never handles the queued frame`);
+    assert.equal(host.provided('hq-admission').bridgeChallengeActive('b_1'), false);
+    assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  }
 });
 
 test('closing a challenged B connection clears the challenge before bind', async () => {
@@ -445,6 +522,78 @@ test('socket close revokes HQ receipt synchronously even if later containment re
   rejectContainment(new Error('containment failed'));
   await closing; // the SDK swallows close errors; revocation has already happened
   await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  const report = await host.stop();
+  assert.match(report.find(({ name }) => name === pkg.name).error, /containment failed/);
+});
+
+test('stop waits for a socket-close revocation already in flight', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const host = createTestHost({ plugins: [faultyBridgeAdmission('none', () => held), brokerPlugin()] });
+  await host.start();
+  await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'e'.repeat(64) }, { connection: 'b_1' });
+  const authority = host.provided('hq-admission');
+  const closing = host.brokerClosed('b_1');
+  assert.equal(authority.live('b_1'), false);
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must drain the close revocation');
+  release();
+  await closing;
+  await stopping;
+  assert.equal(authority.live('b_1'), false);
+});
+
+test('stop succeeds after close and a late verifier both revoke the same B receipt', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  await host.brokerClosed('b_1');
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop still drains the late verifier');
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+});
+
+test('a hung B verifier makes stop fail within its containment deadline', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const host = createTestHost({ plugins: [bridgeAdmission([], { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin({ bridgeStopTimeoutMs: 20 })] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  const report = await host.stop();
+  assert.match(report.find(({ name }) => name === pkg.name).error,
+    /bridge containment unconfirmed: stop drain timed out/);
+  release();
+  await refused;
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
 });
 
 test('stop attempts every B revocation when one containment hook throws', async () => {
