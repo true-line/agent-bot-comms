@@ -13,19 +13,19 @@ import { fileURLToPath } from 'node:url';
 export const VENDOR = fileURLToPath(new URL('../lib/vendor/agent-bot-sdk/', import.meta.url));
 export const SOURCE = JSON.parse(readFileSync(join(VENDOR, 'source.json'), 'utf8'));
 
-export function agentBotHq() {
+export function agentBotHq(commit = SOURCE.commit) {
   const parent = fileURLToPath(new URL('../node_modules/.cache/', import.meta.url));
-  const cache = join(parent, `agent-bot-hq-${SOURCE.commit}`);
+  const cache = join(parent, `agent-bot-hq-${commit}`);
   if (existsSync(join(cache, 'sdk'))) return cache;
   mkdirSync(parent, { recursive: true });
   const work = mkdtempSync(join(parent, 'agent-bot-hq-fetch-'));
   try {
     const git = (...args) => execFileSync('git', ['-C', work, ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
     git('init', '-q');
-    git('fetch', '-q', '--depth', '1', SOURCE.repository, SOURCE.commit);
+    git('fetch', '-q', '--depth', '1', SOURCE.repository, commit);
     git('checkout', '-q', 'FETCH_HEAD');
     const head = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    assert.equal(head, SOURCE.commit, 'fetched agent-bot-hq revision');
+    assert.equal(head, commit, 'fetched agent-bot-hq revision');
     rmSync(join(work, '.git'), { recursive: true, force: true });
     // Test files run in parallel and may fetch at once. The first rename
     // wins; a later one keeps the winner's tree, which another file may
@@ -38,7 +38,7 @@ export function agentBotHq() {
     }
   } catch (error) {
     rmSync(work, { recursive: true, force: true });
-    throw new Error(`cannot fetch agent-bot-hq ${SOURCE.commit}: ${error.stderr?.toString().trim() || error.message}`);
+    throw new Error(`cannot fetch agent-bot-hq ${commit}: ${error.stderr?.toString().trim() || error.message}`);
   }
   return cache;
 }
