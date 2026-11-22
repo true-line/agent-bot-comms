@@ -204,6 +204,30 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
 			t.Fatalf("malformed input returned %d", status)
 		}
 	}
+	for _, extra := range []string{
+		`"system":"alternate instructions"`,
+		`"tools":[{"name":"alternate_tool","input_schema":{"type":"object"}}]`,
+		`"tool_choice":{"type":"tool","name":"alternate_tool"}`,
+		`"thinking":{"type":"enabled","budget_tokens":1024}`,
+		`"temperature":0.5`,
+		`"metadata":{"user_id":"another-user"}`,
+		`"max_tokens":32`,
+	} {
+		body := strings.TrimSuffix(prompt, "}") + "," + extra + "}"
+		if status, _ := f.http(t, body); status != 422 {
+			t.Fatalf("unpinned field %s returned %d", extra, status)
+		}
+	}
+	for _, content := range []string{
+		`"role":"assistant","role":"user","content":"exact prompt"`,
+		`"role":"user","content":[{"type":"text","text":"exact prompt","cache_control":{"type":"ephemeral"}}]`,
+		`"role":"user","content":[{"type":"text","text":"alternate prompt","text":"exact prompt"}]`,
+	} {
+		body := strings.Replace(prompt, `"role":"user","content":"exact prompt"`, content, 1)
+		if status, _ := f.http(t, body); status != 422 {
+			t.Fatalf("unpinned nested fields returned %d for %s", status, content)
+		}
+	}
 	if status, body := f.http(t, prompt); status != 200 || !strings.Contains(body, "fixture response") || !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("unexpected response %d %s", status, body)
 	}

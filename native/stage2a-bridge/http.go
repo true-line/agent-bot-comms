@@ -69,7 +69,7 @@ func objectFields(data []byte, allowed ...string) map[string]json.RawMessage {
 }
 
 func exactPrompt(data []byte, config assignment) bool {
-	fields := objectFields(data, "model", "stream", "messages", "max_tokens", "system", "tools", "metadata", "tool_choice", "thinking", "temperature")
+	fields := objectFields(data, "model", "stream", "messages")
 	if fields == nil {
 		return false
 	}
@@ -80,12 +80,6 @@ func exactPrompt(data []byte, config assignment) bool {
 		json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
 		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 1 {
 		return false
-	}
-	if value, present := fields["max_tokens"]; present {
-		var count int
-		if json.Unmarshal(value, &count) != nil || count < 1 || count > 65536 {
-			return false
-		}
 	}
 	message := objectFields(messages[0], "role", "content")
 	var role string
