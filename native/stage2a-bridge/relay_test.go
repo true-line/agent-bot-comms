@@ -50,7 +50,11 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration) *fixture 
 	cfg := &f.config
 	cfg.Epoch = strings.Repeat("a", 64)
 	cfg.BridgeUID, cfg.HQUID, cfg.RunnerUID = 322, 310, 321
-	cfg.Model, cfg.PromptDigest, cfg.MessagesQuery = "probe", digest([]byte("exact prompt")), "beta=true"
+	cfg.Version = "stage2a-b-assignment/v2"
+	cfg.Model, cfg.MessagesQuery, cfg.HTTPHost = "probe", "beta=true", "unix"
+	cfg.RequestDigest = digest([]byte(strings.Replace(prompt, `"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"`+strings.Repeat("a", 64)+`\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"}`, `"metadata":{}`, 1)))
+	cfg.HeadersDigest = digest([]byte("accept:application/json\nanthropic-beta:fixture-beta\nanthropic-dangerous-direct-browser-access:true\nanthropic-version:2023-06-01\ncontent-type:application/json\nx-app:cli\nx-stainless-retry-count:0\n"))
+	cfg.ClientKeyDigest = digest([]byte("fixture-key"))
 	cfg.Expires = time.Now().Add(time.Minute)
 	cfg.Selectors = selectors{"soul", "st_" + strings.Repeat("b", 24), "ln_" + strings.Repeat("c", 24), "plan", strings.Repeat("d", 64), "sha256:" + strings.Repeat("e", 64)}
 	cfg.Broker.Path, cfg.Relay.Path = filepath.Join(brokerDir, "broker.sock"), filepath.Join(relayDir, "relay.sock")
@@ -103,7 +107,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration) *fixture 
 				result = map[string]string{"bind_receipt": strings.Repeat("1", 64)}
 			case qualifyOp:
 				time.Sleep(providerDelay)
-				if len(req.Payload) != 2 || req.Payload["model"] != cfg.Model || req.Payload["prompt_sha256"] != cfg.PromptDigest {
+				if len(req.Payload) != 2 || req.Payload["model"] != cfg.Model || req.Payload["prompt_sha256"] != cfg.RequestDigest {
 					return
 				}
 				result = map[string]any{"model": cfg.Model, "text": "fixture response", "stop_reason": "end_turn",
@@ -163,6 +167,10 @@ func (f *fixture) stopped(t *testing.T, message string) {
 }
 
 func (f *fixture) http(t *testing.T, body string) (int, string) {
+	return f.httpWith(t, body, "", "beta=true")
+}
+
+func (f *fixture) httpWith(t *testing.T, body, extraHeaders, query string) (int, string) {
 	t.Helper()
 	conn, err := net.Dial("unix", f.config.Relay.Path)
 	if err != nil {
@@ -170,7 +178,7 @@ func (f *fixture) http(t *testing.T, body string) (int, string) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(qualificationTimeout + 2*ioTimeout))
-	fmt.Fprintf(conn, "POST /v1/messages?beta=true HTTP/1.1\r\nHost: unix\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	fmt.Fprintf(conn, "POST /v1/messages?%s HTTP/1.1\r\nHost: unix\r\nAccept: application/json\r\nAnthropic-Beta: fixture-beta\r\nAnthropic-Dangerous-Direct-Browser-Access: true\r\nAnthropic-Version: 2023-06-01\r\nContent-Type: application/json\r\nX-App: cli\r\nX-Stainless-Retry-Count: 0\r\nX-Api-Key: fixture-key\r\nX-Claude-Code-Session-Id: 11111111-1111-1111-1111-111111111111\r\n%sContent-Length: %d\r\n\r\n%s", query, extraHeaders, len(body), body)
 	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		return 0, ""
@@ -183,7 +191,7 @@ func (f *fixture) http(t *testing.T, body string) (int, string) {
 	return response.StatusCode, string(data)
 }
 
-const prompt = `{"model":"probe","stream":true,"messages":[{"role":"user","content":"exact prompt"}]}`
+var prompt = `{"context_management":{},"max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"exact prompt"}]},{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}],"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"` + strings.Repeat("a", 64) + `\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"},"model":"probe","output_config":{},"safeguards":{},"stream":true,"system":[],"thinking":{},"tools":[]}`
 
 func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
 	f := newFixture(t, false, 0)
@@ -197,7 +205,7 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
 		strings.Replace(prompt, "exact prompt", "wrong prompt", 1),
 		strings.Replace(prompt, `"stream":true`, `"stream":true,"runtime_id":"other"`, 1),
 		strings.Replace(prompt, `"stream":true`, `"stream":false,"stream":true`, 1),
-		strings.Replace(prompt, `"content":"exact prompt"`, `"content":"exact prompt","extra":false`, 1),
+		strings.Replace(prompt, `"text":"exact prompt"`, `"text":"exact prompt","extra":false`, 1),
 		strings.Replace(prompt, `"model":"probe"`, `"model":"other"`, 1),
 	} {
 		if status, _ := f.http(t, body); status != 422 {
@@ -219,16 +227,28 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
 		}
 	}
 	for _, content := range []string{
-		`"role":"assistant","role":"user","content":"exact prompt"`,
+		`"role":"assistant","role":"user","content":[{"type":"text","text":"exact prompt"}]`,
 		`"role":"user","content":[{"type":"text","text":"exact prompt","cache_control":{"type":"ephemeral"}}]`,
 		`"role":"user","content":[{"type":"text","text":"alternate prompt","text":"exact prompt"}]`,
 	} {
-		body := strings.Replace(prompt, `"role":"user","content":"exact prompt"`, content, 1)
+		body := strings.Replace(prompt, `"role":"user","content":[{"type":"text","text":"exact prompt"}]`, content, 1)
 		if status, _ := f.http(t, body); status != 422 {
 			t.Fatalf("unpinned nested fields returned %d for %s", status, content)
 		}
 	}
-	if status, body := f.http(t, prompt); status != 200 || !strings.Contains(body, "fixture response") || !strings.Contains(body, "event: message_stop") {
+	if status, _ := f.httpWith(t, prompt, "X-Tool-Override: other\r\n", "beta=true"); status != 422 {
+		t.Fatalf("unassigned header returned %d", status)
+	}
+	if status, _ := f.httpWith(t, prompt, "Anthropic-Beta: other\r\n", "beta=true"); status != 400 {
+		t.Fatalf("duplicate beta header returned %d", status)
+	}
+	if status, _ := f.httpWith(t, prompt, "", "beta=false"); status != 404 {
+		t.Fatalf("unassigned query returned %d", status)
+	}
+	rotatedIdentity := strings.Replace(prompt, strings.Repeat("a", 64), strings.Repeat("b", 64), 1)
+	rotatedIdentity = strings.Replace(rotatedIdentity, "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", 1)
+	rotatedIdentity = strings.Replace(rotatedIdentity, `account_uuid\":\"\"`, `account_uuid\":\"33333333-3333-3333-3333-333333333333\"`, 1)
+	if status, body := f.http(t, rotatedIdentity); status != 200 || !strings.Contains(body, "fixture response") || !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("unexpected response %d %s", status, body)
 	}
 	if status, _ := f.http(t, prompt); status != 409 {

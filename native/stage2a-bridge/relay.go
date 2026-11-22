@@ -72,27 +72,32 @@ type selectors struct {
 }
 
 type assignment struct {
-	Version       string    `json:"version"`
-	Selectors     selectors `json:"selectors"`
-	Epoch         string    `json:"hq_epoch"`
-	BridgeUID     uint32    `json:"bridge_uid"`
-	HQUID         uint32    `json:"hq_uid"`
-	RunnerUID     uint32    `json:"runner_uid"`
-	Expires       time.Time `json:"expires_at"`
-	Broker        endpoint  `json:"broker"`
-	Relay         endpoint  `json:"relay"`
-	Model         string    `json:"model"`
-	PromptDigest  string    `json:"prompt_sha256"`
-	MessagesQuery string    `json:"messages_query"`
+	Version         string    `json:"version"`
+	Selectors       selectors `json:"selectors"`
+	Epoch           string    `json:"hq_epoch"`
+	BridgeUID       uint32    `json:"bridge_uid"`
+	HQUID           uint32    `json:"hq_uid"`
+	RunnerUID       uint32    `json:"runner_uid"`
+	Expires         time.Time `json:"expires_at"`
+	Broker          endpoint  `json:"broker"`
+	Relay           endpoint  `json:"relay"`
+	Model           string    `json:"model"`
+	RequestDigest   string    `json:"request_sha256"`
+	HeadersDigest   string    `json:"headers_sha256"`
+	ClientKeyDigest string    `json:"client_key_sha256"`
+	HTTPHost        string    `json:"http_host"`
+	MessagesQuery   string    `json:"messages_query"`
 }
 
 func (a assignment) validate() error {
 	s := a.Selectors
 	uidOK := func(id uint32) bool { return id >= 300 && id <= 399 }
-	if a.Version != "stage2a-b-assignment/v1" || !idPattern.MatchString(s.Installation) ||
+	if a.Version != "stage2a-b-assignment/v2" || !idPattern.MatchString(s.Installation) ||
 		!startPattern.MatchString(s.Start) || !launchPattern.MatchString(s.Launch) ||
 		!idPattern.MatchString(s.Plan) || !hexPattern.MatchString(s.PlanDigest) || !validDigest(s.Reservation) ||
-		!hexPattern.MatchString(a.Epoch) || !idPattern.MatchString(a.Model) || !validDigest(a.PromptDigest) ||
+		!hexPattern.MatchString(a.Epoch) || !idPattern.MatchString(a.Model) ||
+		!validDigest(a.RequestDigest) || !validDigest(a.HeadersDigest) || !validDigest(a.ClientKeyDigest) ||
+		!idPattern.MatchString(a.HTTPHost) ||
 		!queryPattern.MatchString(a.MessagesQuery) || !time.Now().Before(a.Expires) ||
 		!uidOK(a.BridgeUID) || !uidOK(a.HQUID) || !uidOK(a.RunnerUID) ||
 		a.BridgeUID == a.HQUID || a.BridgeUID == a.RunnerUID || a.HQUID == a.RunnerUID ||

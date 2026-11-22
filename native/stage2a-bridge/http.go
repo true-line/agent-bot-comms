@@ -9,11 +9,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 const maxBody = 256 << 10
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func readRequest(conn *net.UnixConn) (*http.Request, error) {
 	reader := bufio.NewReaderSize(conn, 16384)
@@ -68,37 +72,95 @@ func objectFields(data []byte, allowed ...string) map[string]json.RawMessage {
 	return result
 }
 
-func exactPrompt(data []byte, config assignment) bool {
-	fields := objectFields(data, "model", "stream", "messages")
-	if fields == nil {
-		return false
+// normalizedRequest removes the only observed volatile stock-client field.
+// It validates every JSON object for duplicate keys, then serializes the
+// original raw values with metadata set to {}. All remaining body bytes are
+// committed by the Machine-signed request_sha256 in the B assignment.
+// Neither the raw body nor user_id is sent to HQ or the provider.
+func normalizedRequest(data []byte, config assignment) (string, error) {
+	fields := objectFields(data, "context_management", "max_tokens", "messages", "metadata", "model",
+		"output_config", "safeguards", "stream", "system", "thinking", "tools")
+	if len(fields) != 11 {
+		return "", invalid
 	}
 	var model string
 	var stream bool
 	var messages []json.RawMessage
 	if json.Unmarshal(fields["model"], &model) != nil || model != config.Model ||
 		json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
-		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 1 {
+		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 2 {
+		return "", invalid
+	}
+	for index, expected := range []string{"user", "system"} {
+		message := objectFields(messages[index], "role", "content", "output_config")
+		var role string
+		if message == nil || json.Unmarshal(message["role"], &role) != nil || role != expected ||
+			(index == 0 && len(message) != 2) || (index == 1 && len(message) != 3) {
+			return "", invalid
+		}
+	}
+	metadata := objectFields(fields["metadata"], "user_id")
+	var userID string
+	if len(metadata) != 1 || json.Unmarshal(metadata["user_id"], &userID) != nil || len(userID) > 1024 {
+		return "", invalid
+	}
+	var identity struct {
+		Account string `json:"account_uuid"`
+		Device  string `json:"device_id"`
+		Session string `json:"session_id"`
+	}
+	if decode([]byte(userID), &identity) != nil || (identity.Account != "" && !uuidPattern.MatchString(identity.Account)) ||
+		!hexPattern.MatchString(identity.Device) || !uuidPattern.MatchString(identity.Session) {
+		return "", invalid
+	}
+	fields["metadata"] = json.RawMessage(`{}`)
+	// encoding/json sorts object keys and compacts RawMessage values. This
+	// exact Go byte profile is versioned by stage2a-b-assignment/v2; the
+	// independent signer pins its digest, never a client-supplied digest.
+	normalized, err := json.Marshal(fields)
+	if err != nil || digest(normalized) != config.RequestDigest {
+		return "", invalid
+	}
+	return config.RequestDigest, nil
+}
+
+// approvedHeaders commits every nonvolatile header, including the API version,
+// beta list and dangerous-browser flag. Credential and session identifiers are
+// checked locally and discarded; they never enter the HQ/provider payload.
+func approvedHeaders(req *http.Request, config assignment) bool {
+	if req.Host != config.HTTPHost || req.Header.Get("Accept") != "application/json" ||
+		req.Header.Get("Anthropic-Version") == "" || req.Header.Get("Anthropic-Beta") == "" ||
+		req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access") == "" ||
+		req.Header.Get("X-Stainless-Retry-Count") != "0" ||
+		req.Header.Get("Authorization") != "" || req.Header.Get("Cookie") != "" ||
+		req.Header.Get("Proxy-Authorization") != "" {
 		return false
 	}
-	message := objectFields(messages[0], "role", "content")
-	var role string
-	if json.Unmarshal(message["role"], &role) != nil || role != "user" {
+	key := req.Header.Get("X-Api-Key")
+	if key == "" || digest([]byte(key)) != config.ClientKeyDigest ||
+		!uuidPattern.MatchString(req.Header.Get("X-Claude-Code-Session-Id")) {
 		return false
 	}
-	var text string
-	content := message["content"]
-	if len(content) > 0 && content[0] == '"' && json.Unmarshal(content, &text) == nil {
-		return digest([]byte(text)) == config.PromptDigest
+	names := make([]string, 0, len(req.Header))
+	for name, values := range req.Header {
+		if len(values) != 1 || strings.ContainsAny(values[0], "\r\n") {
+			return false
+		}
+		switch strings.ToLower(name) {
+		case "content-length", "x-api-key", "x-claude-code-session-id":
+			continue
+		}
+		names = append(names, strings.ToLower(name))
 	}
-	var blocks []json.RawMessage
-	if json.Unmarshal(content, &blocks) != nil || len(blocks) != 1 {
-		return false
+	sort.Strings(names)
+	var canonical strings.Builder
+	for _, name := range names {
+		canonical.WriteString(name)
+		canonical.WriteByte(':')
+		canonical.WriteString(req.Header.Get(name))
+		canonical.WriteByte('\n')
 	}
-	block := objectFields(blocks[0], "type", "text")
-	var kind string
-	return json.Unmarshal(block["type"], &kind) == nil && kind == "text" && len(block["text"]) > 0 &&
-		block["text"][0] == '"' && json.Unmarshal(block["text"], &text) == nil && digest([]byte(text)) == config.PromptDigest
+	return digest([]byte(canonical.String())) == config.HeadersDigest
 }
 
 func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) {
@@ -177,7 +239,12 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(req.Body, size+1))
-	if err != nil || int64(len(data)) != size || !exactPrompt(data, config) {
+	if err != nil || int64(len(data)) != size || !approvedHeaders(req, config) {
+		writeHTTP(conn, 422, "text/plain", nil)
+		return nil
+	}
+	requestDigest, err := normalizedRequest(data, config)
+	if err != nil {
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
 	}
@@ -186,9 +253,9 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 	}
 	*attempted = true
 	payload := struct {
-		Model  string `json:"model"`
-		Digest string `json:"prompt_sha256"`
-	}{config.Model, config.PromptDigest}
+		Model        string `json:"model"`
+		PromptDigest string `json:"prompt_sha256"`
+	}{config.Model, requestDigest}
 	var result qualificationResult
 	if b.call(ctx, "qualify", qualifyOp, payload, &result) != nil || !result.valid(config.Model) ||
 		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
