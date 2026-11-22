@@ -12,7 +12,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
-import { BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, brokerPlugin } from '../lib/hq-plugin/broker.mjs';
+import {
+  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, brokerPlugin,
+} from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
 import { fail } from '../lib/vendor/agent-bot-sdk/errors.mjs';
@@ -335,6 +337,104 @@ test('bridge route stays unavailable on an HQ without dedicated B authority', as
   await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' }), code('host.invalid_request'));
   await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'f'.repeat(64) }, { connection: 'b_1' }), code('host.invalid_request'));
   assert.equal(host.provided(pkg.name).boundBridgeConnections(), 0);
+});
+
+const PROTECTED_SCOPE = Object.freeze({
+  installation_id: 'install_1',
+  start_id: `st_${'a'.repeat(24)}`,
+  launch_id: `ln_${'b'.repeat(24)}`,
+  plan_id: 'plan_1',
+  plan_digest: 'c'.repeat(64),
+  reservation_digest: `sha256:${'d'.repeat(64)}`,
+});
+const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
+const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
+
+const protectedAdmission = (log, context = PROTECTED_CONTEXT) => definePlugin({
+  name: 'hq-admission', version: '0.1.0', hostApi: 1,
+  async init() {
+    return { provides: {
+      async bridgeBindChallengeV2(input, { connection }) {
+        log.push(['challenge_v2', input, connection]);
+        return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
+          hq_epoch: '1'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async verifyBridgeBindingV2(input, { connection }) {
+        log.push(['bind_v2', input, connection]);
+        return { bind_receipt: '2'.repeat(64) };
+      },
+      forgetBridgeConnection(connection, receipt) { log.push(['forget_bridge', connection, receipt]); },
+    } };
+  },
+});
+
+test('protected bridge bind uses the launch reservation on the same connection', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log), brokerPlugin()] });
+  await host.start();
+  const connection = 'b_v2';
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+  assert.equal(challenge.context, PROTECTED_CONTEXT);
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND, PROTECTED_FRAME, { connection }), code('host.invalid_request'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection: 'replacement' }), code('host.invalid_request'));
+  const bound = await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+  assert.deepEqual(bound, { bind_receipt: '2'.repeat(64) });
+  assert.equal(host.provided(pkg.name).boundConnections(), 0);
+  assert.equal(host.provided(pkg.name).boundBridgeConnections(), 1);
+  await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection }), code('host.invalid_request'));
+  await host.brokerClosed(connection);
+  assert.deepEqual(log, [
+    ['challenge_v2', PROTECTED_SCOPE, connection],
+    ['bind_v2', PROTECTED_FRAME, connection],
+    ['forget_bridge', connection, bound.bind_receipt],
+  ]);
+});
+
+test('protected bridge rejects runtime IDs, malformed digests and v1 HQ challenges', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log, BRIDGE_CONTEXT), brokerPlugin()] });
+  await host.start();
+  const connection = 'b_v2';
+  for (const frame of [BRIDGE_SCOPE, { ...PROTECTED_SCOPE, runtime_id: 'rt_old' },
+    { ...PROTECTED_SCOPE, reservation_digest: 'a'.repeat(64) },
+    { ...PROTECTED_SCOPE, launch_id: [PROTECTED_SCOPE.launch_id] }]) {
+    await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, frame, { connection }), code('host.invalid_request'));
+  }
+  assert.deepEqual(log, []);
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection }), code('host.invalid_request'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection }), code('host.invalid_request'));
+  assert.deepEqual(log, [
+    ['challenge_v2', PROTECTED_SCOPE, connection],
+    ['forget_bridge', connection, undefined],
+  ]);
+});
+
+test('protected bridge bind revokes the challenge if its response carries a runtime ID', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log), brokerPlugin()] });
+  await host.start();
+  const connection = 'b_v2';
+  await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, { ...PROTECTED_FRAME, runtime_id: 'rt_old' }, { connection }), code('host.invalid_request'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection }), code('host.invalid_request'));
+  assert.deepEqual(log, [
+    ['challenge_v2', PROTECTED_SCOPE, connection],
+    ['forget_bridge', connection, undefined],
+  ]);
+});
+
+test('protected bridge never falls back to the v1 HQ authority', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log), brokerPlugin()] });
+  await host.start();
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection: 'b_1' }), code('host.invalid_request'));
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection: 'b_1' }), code('host.invalid_request'));
+  await host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  assert.deepEqual(log, [['challenge', 'b_1'], ['bind', 'b_1']]);
+  await host.stop();
 });
 
 test('plugin stop revokes every live B receipt', async () => {
