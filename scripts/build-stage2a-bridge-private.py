@@ -22,6 +22,7 @@ import tempfile
 TEAM_ID = "Z5DM34QS5U"
 REPOSITORY = "https://github.com/true-line/agent-bot-comms.git"
 BINARY_NAME = "agent-comms-stage2a-bridge"
+SIGNING_ID = "ai.true-line.agent-bot-comms.stage2a-bridge"
 ARGV = ["--assignment-fd", "3", "--proof-fd", "4", "--status-fd", "5"]
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 
@@ -93,7 +94,7 @@ def selected_identity(keychain):
     return matching[0]
 
 
-def check_binary(binary, signing_id):
+def check_binary(binary):
     if run("lipo", "-archs", str(binary)) != "arm64":
         fail("bridge must be arm64-only")
     dependencies = []
@@ -112,7 +113,7 @@ def check_binary(binary, signing_id):
     for expected in (
         "Authority=Developer ID Application: ",
         f"TeamIdentifier={TEAM_ID}\n",
-        f"Identifier={signing_id}\n",
+        f"Identifier={SIGNING_ID}\n",
         "flags=0x10000(runtime)",
     ):
         if expected not in details:
@@ -127,7 +128,6 @@ def main():
     parser.add_argument("--go-version", required=True, help="reviewed Go version, e.g. go1.27.4")
     parser.add_argument("--sdk-version", required=True, help="reviewed macOS SDK version")
     parser.add_argument("--clang-version", required=True, help="reviewed first line of Apple clang --version")
-    parser.add_argument("--signing-id", required=True, help="reviewed signing identifier")
     parser.add_argument("--sign-keychain", required=True, type=Path)
     parser.add_argument("--notary-profile", required=True, help="existing notarytool Keychain profile")
     parser.add_argument("--output-dir", required=True, type=Path, help="new private artifact directory")
@@ -142,8 +142,6 @@ def main():
     parent_stat = parent.stat()
     if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
         fail("output parent must be owned by this user and mode 0700")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", args.signing_id):
-        fail("invalid signing identifier")
     keychain = args.sign_keychain.expanduser().resolve(strict=True)
     source_check(root, args.tag, args.source_sha)
     sdk_path = toolchain_check(args.go_version, args.sdk_version, args.clang_version)
@@ -171,9 +169,9 @@ def main():
         run(
             "codesign", "--force", "--timestamp", "--options", "runtime",
             "--keychain", str(keychain), "-s", identity,
-            "-i", args.signing_id, str(binary),
+            "-i", SIGNING_ID, str(binary),
         )
-        dependencies = check_binary(binary, args.signing_id)
+        dependencies = check_binary(binary)
         signed_sha = digest(binary)
         archive = temporary / f"{BINARY_NAME}-{args.tag}-darwin-arm64.zip"
         run("ditto", "-c", "-k", "--keepParent", str(binary), str(archive))
@@ -204,7 +202,7 @@ def main():
             "architecture": "arm64",
             "dynamicDependencies": dependencies,
             "teamId": TEAM_ID,
-            "signingIdentifier": args.signing_id,
+            "signingIdentifier": SIGNING_ID,
             "binaryName": BINARY_NAME,
             "binarySha256BeforeSigning": unsigned_sha,
             "binarySha256": signed_sha,
