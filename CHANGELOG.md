@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The private Stage 2a B build archives its signed binary at the ZIP root, so
+  extraction can verify the exact signed bytes before notarization.
+
 ## [0.5.7] - 2026-11-22
 
 ### Added

@@ -174,7 +174,7 @@ def main():
         dependencies = check_binary(binary)
         signed_sha = digest(binary)
         archive = temporary / f"{BINARY_NAME}-{args.tag}-darwin-arm64.zip"
-        run("ditto", "-c", "-k", "--keepParent", str(binary), str(archive))
+        run("ditto", "-c", "-k", str(binary), str(archive))
         extracted = temporary / "extracted"
         extracted.mkdir(mode=0o700)
         run("ditto", "-x", "-k", str(archive), str(extracted))
