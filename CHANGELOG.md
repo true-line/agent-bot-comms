@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-11-22
+
+### Fixed
+
+- The installed HQ broker permits a one-use Stage 2a qualification request only
+  from a v2-bound bridge while HQ's Machine-backed capability is live. A direct
+  plugin opt-in cannot bypass the HQ gate.
+
 ## [0.5.8] - 2026-11-22
 
 ### Fixed
