@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-11-22
+
 ### Fixed
 
 - The private Stage 2a B build archives its signed binary at the ZIP root, so
