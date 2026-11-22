@@ -69,13 +69,16 @@ def source_check(root, tag, source_sha):
     run("git", "merge-base", "--is-ancestor", source_sha, "FETCH_HEAD", cwd=root)
 
 
-def toolchain_check(go_version, sdk_version):
+def toolchain_check(go_version, sdk_version, clang_version):
     actual_go = run("go", "version")
     if actual_go != f"go version {go_version} darwin/arm64":
         fail(f"Go version/host differs from reviewed {go_version} darwin/arm64")
     actual_sdk = run("xcrun", "--sdk", "macosx", "--show-sdk-version")
     if actual_sdk != sdk_version:
         fail(f"macOS SDK differs from reviewed {sdk_version}")
+    actual_clang = run("xcrun", "clang", "--version").splitlines()[0]
+    if actual_clang != clang_version:
+        fail("Apple clang differs from reviewed version")
     return run("xcrun", "--sdk", "macosx", "--show-sdk-path")
 
 
@@ -123,6 +126,7 @@ def main():
     parser.add_argument("--source-sha", required=True, help="reviewed full source commit SHA")
     parser.add_argument("--go-version", required=True, help="reviewed Go version, e.g. go1.27.4")
     parser.add_argument("--sdk-version", required=True, help="reviewed macOS SDK version")
+    parser.add_argument("--clang-version", required=True, help="reviewed first line of Apple clang --version")
     parser.add_argument("--signing-id", required=True, help="reviewed signing identifier")
     parser.add_argument("--sign-keychain", required=True, type=Path)
     parser.add_argument("--notary-profile", required=True, help="existing notarytool Keychain profile")
@@ -142,7 +146,7 @@ def main():
         fail("invalid signing identifier")
     keychain = args.sign_keychain.expanduser().resolve(strict=True)
     source_check(root, args.tag, args.source_sha)
-    sdk_path = toolchain_check(args.go_version, args.sdk_version)
+    sdk_path = toolchain_check(args.go_version, args.sdk_version, args.clang_version)
     identity = selected_identity(keychain)
     os.umask(0o077)
     temporary = Path(tempfile.mkdtemp(prefix=".stage2a-bridge-", dir=parent))
@@ -195,6 +199,7 @@ def main():
             "goVersion": args.go_version,
             "macosSdkVersion": args.sdk_version,
             "macosSdkPath": sdk_path,
+            "appleClangVersion": args.clang_version,
             "goBuildInfo": build_info.splitlines(),
             "architecture": "arm64",
             "dynamicDependencies": dependencies,
