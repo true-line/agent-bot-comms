@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-11-22
+
+### Added
+
+- A default-off Stage 2a B relay source path with a native Darwin bridge,
+  Machine-signed v2 assignment binding, exact stock Messages request checks,
+  and a dedicated broker route. A local operator script builds and notarizes
+  the B binary for private installation; the public release carries source
+  only. Installed launch and host qualification remain separate gates.
+
 ## [0.5.6] - 2026-11-21
 
 ### Changed
