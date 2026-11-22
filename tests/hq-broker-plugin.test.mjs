@@ -354,7 +354,8 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
-      bridgeQualificationEnabledV2: () => qualificationEnabled,
+      bridgeQualificationEnabledV2: () => typeof qualificationEnabled === 'function'
+        ? qualificationEnabled() : qualificationEnabled,
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
@@ -469,6 +470,31 @@ test('direct factory opt-in cannot bypass an absent HQ qualification capability'
       model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}`,
     }, { connection }), code('caller_mismatch'));
     assert.equal(log.length, 2);
+  } finally {
+    await host.stop();
+  }
+});
+
+test('packaged broker rechecks HQ qualification capability on the live B request', async () => {
+  const log = [];
+  let enabled = true;
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, () => enabled), plugin,
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_revoked';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    enabled = false;
+    const frame = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+    await assert.rejects(host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection }),
+      code('caller_mismatch'));
+    assert.equal(log.length, 2);
+    enabled = true;
+    assert.deepEqual(await host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection }),
+      { model: frame.model });
+    assert.equal(log.at(-1)[0], 'qualify');
   } finally {
     await host.stop();
   }
