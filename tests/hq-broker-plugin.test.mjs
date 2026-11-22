@@ -5,14 +5,14 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
-import { brokerPlugin } from '../lib/hq-plugin/broker.mjs';
+import { BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, brokerPlugin } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
 import { fail } from '../lib/vendor/agent-bot-sdk/errors.mjs';
@@ -229,4 +229,385 @@ test('an HQ without bind challenges refuses the challenge and still binds by cha
   await assert.rejects(host.brokerAccept('bind.challenge', { runtime_id: 'rt_lead' }, { connection: 'bc_1' }), code('host.invalid_request'));
   await host.brokerAccept('bind', { runtime_id: 'rt_lead', channel_binding: RUNTIMES.rt_lead.channel_binding }, { connection: 'bc_1' });
   await host.brokerClosed('bc_1');
+});
+
+const BRIDGE_SCOPE = Object.freeze({
+  installation_id: 'install_1', start_id: 'start_1', launch_id: 'launch_1',
+  runtime_id: 'rt_bridge', plan_id: 'plan_1', plan_digest: 'a'.repeat(64),
+});
+const BRIDGE_KEY = 'b'.repeat(64);
+const BRIDGE_CONTEXT = 'agent-bot-stage2a-bridge-bind-v1';
+const bridgeProof = (nonce, epoch) => createHmac('sha256', Buffer.from(BRIDGE_KEY, 'hex'))
+  .update(JSON.stringify([BRIDGE_CONTEXT, nonce, epoch, BRIDGE_SCOPE])).digest('hex');
+
+// HQ owns this authority. The stand-in models a Machine-approved assignment,
+// current HQ epoch, one-use HMAC challenge and live receipt. Comms must only
+// hand it the actual connection and must never turn B into a member runtime.
+const bridgeAdmission = (log, { beforeChallenge, beforeBridgeBind } = {}) => definePlugin({
+  name: 'hq-admission', version: '0.1.0', hostApi: 1,
+  async init() {
+    const challenges = new Map();
+    const live = new Map();
+    const spent = new Set();
+    const closed = new Set();
+    const epoch = '7'.repeat(64);
+    function assigned(input, connection) {
+      return /^b_[0-9]+$/.test(connection) && !closed.has(connection)
+        && Object.keys(BRIDGE_SCOPE).every((key) => input?.[key] === BRIDGE_SCOPE[key]);
+    }
+    return { provides: {
+      async verifyBinding() { fail('caller_mismatch', 'B is not a member'); },
+      async bridgeBindChallenge(input, { connection }) {
+        log.push(['challenge', connection]);
+        if (!assigned(input, connection) || spent.has(input.start_id)) fail('caller_mismatch', 'wrong bridge assignment');
+        if (beforeChallenge) await beforeChallenge();
+        const nonce = 'c'.repeat(64);
+        challenges.set(connection, nonce);
+        return { nonce, algorithm: 'hmac-sha256', context: BRIDGE_CONTEXT,
+          hq_epoch: epoch, expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async verifyBridgeBinding(input, { connection }) {
+        log.push(['bind', connection]);
+        const nonce = challenges.get(connection);
+        challenges.delete(connection);
+        if (!nonce || !assigned(input, connection) || spent.has(input.start_id) ||
+            input.proof !== bridgeProof(nonce, epoch)) fail('caller_mismatch', 'wrong bridge proof');
+        if (beforeBridgeBind) await beforeBridgeBind();
+        spent.add(input.start_id);
+        const bind_receipt = 'd'.repeat(64);
+        live.set(connection, bind_receipt);
+        return { bind_receipt };
+      },
+      forgetBridgeConnection(connection, receipt) {
+        log.push(['forget_bridge', connection, receipt]);
+        closed.add(connection);
+        challenges.delete(connection);
+        live.delete(connection);
+      },
+      liveBridgeReceipt: (connection) => live.get(connection),
+      bridgeChallengeActive: (connection) => challenges.has(connection),
+    } };
+  },
+});
+
+test('B bind is separate from member delivery and close revokes its live receipt', async () => {
+  const log = [];
+  const seen = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log), consumer(seen), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  assert.equal(challenge.hq_epoch, '7'.repeat(64));
+  const bound = await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  assert.deepEqual(bound, { bind_receipt: 'd'.repeat(64) });
+  const broker = host.provided(pkg.name);
+  assert.equal(broker.boundConnections(), 0);
+  assert.equal(broker.boundBridgeConnections(), 1);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), bound.bind_receipt);
+  await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept('bind', bindAs('rt_lead'), { connection: 'b_1' }), code('host.invalid_request'));
+  assert.deepEqual(seen, []);
+  await host.brokerClosed('b_1');
+  assert.equal(broker.boundBridgeConnections(), 0);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.deepEqual(log.at(-1), ['forget_bridge', 'b_1', bound.bind_receipt]);
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_2' }), code('caller_mismatch'));
+});
+
+test('B bind delegates wrong UID, start, epoch proof and replay refusals to HQ', async () => {
+  const host = createTestHost({ plugins: [bridgeAdmission([]), brokerPlugin()] });
+  await host.start();
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'r_1' }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'other_b_socket' }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, { ...BRIDGE_SCOPE, start_id: 'old_start' }, { connection: 'b_1' }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, { ...BRIDGE_SCOPE, plan_digest: 'e'.repeat(64) }, { connection: 'b_2' }), code('caller_mismatch'));
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_3' });
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, 'old_hq_epoch') }, { connection: 'b_3' }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_3' }), code('host.invalid_request'));
+  const fresh = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_4' });
+  await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(fresh.nonce, fresh.hq_epoch) }, { connection: 'b_4' });
+  await host.brokerClosed('b_4');
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_5' }), code('caller_mismatch'));
+});
+
+test('bridge route stays unavailable on an HQ without dedicated B authority', async () => {
+  const host = createTestHost({ plugins: [admission(), brokerPlugin()] });
+  await host.start();
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' }), code('host.invalid_request'));
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'f'.repeat(64) }, { connection: 'b_1' }), code('host.invalid_request'));
+  assert.equal(host.provided(pkg.name).boundBridgeConnections(), 0);
+});
+
+test('plugin stop revokes every live B receipt', async () => {
+  const host = createTestHost({ plugins: [bridgeAdmission([]), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), 'd'.repeat(64));
+  await host.stop();
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+});
+
+test('stop drains a verifier that installs a B receipt after the first revocation', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must wait for the late verifier');
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 1);
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+});
+
+test('stop drains a challenge that installs after the first revocation', async () => {
+  let entered, release;
+  const challenging = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeChallenge: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const refused = assert.rejects(challenge, code('host.invalid_request'));
+  await challenging;
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must wait for the late challenge');
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+  assert.equal(host.provided('hq-admission').bridgeChallengeActive('b_1'), false);
+});
+
+test('same-tick socket close fences a queued B challenge or bind before HQ runs', async () => {
+  for (const phase of ['challenge', 'bind']) {
+    const log = [];
+    const host = createTestHost({ plugins: [bridgeAdmission(log), brokerPlugin()] });
+    await host.start();
+    const first = phase === 'bind'
+      ? await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' }) : null;
+    const pending = phase === 'challenge'
+      ? host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' })
+      : host.brokerAccept(BRIDGE_BIND,
+        { ...BRIDGE_SCOPE, proof: bridgeProof(first.nonce, first.hq_epoch) }, { connection: 'b_1' });
+    const refused = assert.rejects(pending, code('host.invalid_request'));
+    await host.brokerClosed('b_1');
+    await refused;
+    assert.equal(log.filter(([kind]) => kind === (phase === 'challenge' ? 'challenge' : 'bind')).length,
+      0, `${phase}: HQ never handles the queued frame`);
+    assert.equal(host.provided('hq-admission').bridgeChallengeActive('b_1'), false);
+    assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  }
+});
+
+test('closing a challenged B connection clears the challenge before bind', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log), brokerPlugin()] });
+  await host.start();
+  await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  await host.brokerClosed('b_1');
+  assert.deepEqual(log.at(-1), ['forget_bridge', 'b_1', undefined]);
+  await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'f'.repeat(64) }, { connection: 'b_1' }), code('host.invalid_request'));
+});
+
+test('a connection closed during B bind cannot leave a live receipt', async () => {
+  let release;
+  let held;
+  const holding = new Promise((resolve) => { held = resolve; });
+  const host = createTestHost({ plugins: [bridgeAdmission([]), brokerPlugin({ beforeBind: () => {
+    held();
+    return new Promise((resolve) => { release = resolve; });
+  } })] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const pending = host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  await holding;
+  await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  await host.brokerClosed('b_1');
+  release();
+  await assert.rejects(pending, code('caller_mismatch'));
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.equal(host.provided(pkg.name).boundBridgeConnections(), 0);
+});
+
+const faultyBridgeAdmission = (fault, onForget) => definePlugin({
+  name: 'hq-admission', version: '0.1.0', hostApi: 1,
+  async init() {
+    const challenged = new Set();
+    const live = new Map();
+    let forgets = 0;
+    return { provides: {
+      bridgeBindChallenge(_input, { connection }) {
+        challenged.add(connection);
+        if (fault === 'challenge_throws') fail('caller_mismatch', 'HQ failed after installing challenge');
+        if (fault === 'challenge_malformed') return { nonce: 'invalid' };
+        return { nonce: 'c'.repeat(64), algorithm: 'hmac-sha256', context: BRIDGE_CONTEXT,
+          hq_epoch: '7'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      verifyBridgeBinding(_input, { connection }) {
+        challenged.delete(connection);
+        live.set(connection, 'd'.repeat(64));
+        if (fault === 'bind_throws') fail('caller_mismatch', 'HQ failed after installing receipt');
+        if (fault === 'bind_malformed') return { bind_receipt: 'invalid' };
+        return { bind_receipt: 'd'.repeat(64) };
+      },
+      forgetBridgeConnection(connection) {
+        forgets += 1;
+        challenged.delete(connection);
+        live.delete(connection); // synchronous, before containment completes
+        return onForget?.();
+      },
+      challenged: (connection) => challenged.has(connection),
+      live: (connection) => live.has(connection),
+      forgets: () => forgets,
+    } };
+  },
+});
+
+for (const fault of ['challenge_throws', 'challenge_malformed', 'bind_throws', 'bind_malformed']) {
+  test(`ambiguous HQ ${fault} response revokes B authority by connection`, async () => {
+    const host = createTestHost({ plugins: [faultyBridgeAdmission(fault), brokerPlugin(), consumer([])] });
+    await host.start();
+    if (fault.startsWith('challenge_')) {
+      await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' }),
+        code(fault === 'challenge_malformed' ? 'host.invalid_request' : 'caller_mismatch'));
+    } else {
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+      await assert.rejects(host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'e'.repeat(64) }, { connection: 'b_1' }),
+        code(fault === 'bind_malformed' ? 'host.invalid_request' : 'caller_mismatch'));
+    }
+    const authority = host.provided('hq-admission');
+    assert.equal(authority.challenged('b_1'), false);
+    assert.equal(authority.live('b_1'), false);
+    assert.equal(authority.forgets(), 1);
+    assert.equal(host.provided(pkg.name).boundBridgeConnections(), 0);
+    await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  });
+}
+
+test('socket close revokes HQ receipt synchronously even if later containment rejects', async () => {
+  let rejectContainment;
+  const containment = new Promise((_resolve, reject) => { rejectContainment = reject; });
+  const host = createTestHost({ plugins: [faultyBridgeAdmission('none', () => containment), brokerPlugin(), consumer([])] });
+  await host.start();
+  await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'e'.repeat(64) }, { connection: 'b_1' });
+  const authority = host.provided('hq-admission');
+  assert.equal(authority.live('b_1'), true);
+  const closing = host.brokerClosed('b_1'); // HQ's socket server may ignore this promise
+  assert.equal(authority.live('b_1'), false);
+  assert.equal(host.provided(pkg.name).boundBridgeConnections(), 0);
+  rejectContainment(new Error('containment failed'));
+  await closing; // the SDK swallows close errors; revocation has already happened
+  await assert.rejects(host.brokerAccept('task.commit', { n: 1 }, { connection: 'b_1' }), code('caller_mismatch'));
+  const report = await host.stop();
+  assert.match(report.find(({ name }) => name === pkg.name).error, /containment failed/);
+});
+
+test('stop waits for a socket-close revocation already in flight', async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const host = createTestHost({ plugins: [faultyBridgeAdmission('none', () => held), brokerPlugin()] });
+  await host.start();
+  await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'e'.repeat(64) }, { connection: 'b_1' });
+  const authority = host.provided('hq-admission');
+  const closing = host.brokerClosed('b_1');
+  assert.equal(authority.live('b_1'), false);
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop must drain the close revocation');
+  release();
+  await closing;
+  await stopping;
+  assert.equal(authority.live('b_1'), false);
+});
+
+test('stop succeeds after close and a late verifier both revoke the same B receipt', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const log = [];
+  const host = createTestHost({ plugins: [bridgeAdmission(log, { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin()] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  await host.brokerClosed('b_1');
+  let stopped = false;
+  const stopping = host.stop().finally(() => { stopped = true; });
+  await new Promise(setImmediate);
+  assert.equal(stopped, false, 'stop still drains the late verifier');
+  release();
+  await refused;
+  const report = await stopping;
+  assert.equal(report.find(({ name }) => name === pkg.name).ok, true);
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+  assert.equal(log.filter(([kind]) => kind === 'forget_bridge').length, 2);
+});
+
+test('a hung B verifier makes stop fail within its containment deadline', async () => {
+  let entered, release;
+  const verifying = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const host = createTestHost({ plugins: [bridgeAdmission([], { beforeBridgeBind: () => {
+    entered();
+    return held;
+  } }), brokerPlugin({ bridgeStopTimeoutMs: 20 })] });
+  await host.start();
+  const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection: 'b_1' });
+  const binding = host.brokerAccept(BRIDGE_BIND,
+    { ...BRIDGE_SCOPE, proof: bridgeProof(challenge.nonce, challenge.hq_epoch) }, { connection: 'b_1' });
+  const refused = assert.rejects(binding, code('host.invalid_request'));
+  await verifying;
+  const report = await host.stop();
+  assert.match(report.find(({ name }) => name === pkg.name).error,
+    /bridge containment unconfirmed: stop drain timed out/);
+  release();
+  await refused;
+  assert.equal(host.provided('hq-admission').liveBridgeReceipt('b_1'), undefined);
+});
+
+test('stop attempts every B revocation when one containment hook throws', async () => {
+  const host = createTestHost({ plugins: [faultyBridgeAdmission('none', () => { throw new Error('containment failed'); }), brokerPlugin()] });
+  await host.start();
+  for (const connection of ['b_1', 'b_2']) {
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE, BRIDGE_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND, { ...BRIDGE_SCOPE, proof: 'e'.repeat(64) }, { connection });
+  }
+  const authority = host.provided('hq-admission');
+  assert.equal(authority.live('b_1'), true);
+  assert.equal(authority.live('b_2'), true);
+  await host.stop().catch(() => {}); // host lifecycle may report the hook failure
+  assert.equal(authority.live('b_1'), false);
+  assert.equal(authority.live('b_2'), false);
+  assert.equal(authority.forgets(), 2);
 });
