@@ -350,10 +350,12 @@ const PROTECTED_SCOPE = Object.freeze({
 const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
 
-const protectedAdmission = (log, context = PROTECTED_CONTEXT) => definePlugin({
+const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
+      bridgeQualificationEnabledV2: () => typeof qualificationEnabled === 'function'
+        ? qualificationEnabled() : qualificationEnabled,
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
@@ -402,7 +404,9 @@ test('bridge qualification route is opt-in and never grants member delivery', as
   const frame = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
   for (const enableBridgeQualification of [false, true]) {
     const log = [];
-    const host = createTestHost({ plugins: [protectedAdmission(log), brokerPlugin({ enableBridgeQualification })] });
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, true), brokerPlugin({ enableBridgeQualification }),
+    ] });
     await host.start();
     try {
       const connection = 'b_v2';
@@ -422,6 +426,77 @@ test('bridge qualification route is opt-in and never grants member delivery', as
     } finally {
       await host.stop();
     }
+  }
+});
+
+test('packaged broker delegates qualification only with an HQ authority capability', async () => {
+  const frame = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+  for (const qualificationEnabled of [false, true]) {
+    const log = [];
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, qualificationEnabled), plugin,
+    ] });
+    await host.start();
+    try {
+      const connection = `b_${qualificationEnabled}`;
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+      const { bind_receipt } = await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+      const request = host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection });
+      if (qualificationEnabled) {
+        assert.deepEqual(await request, { model: frame.model });
+        assert.deepEqual(log.at(-1), ['qualify', frame, connection, bind_receipt]);
+      } else {
+        await assert.rejects(request, code('caller_mismatch'));
+        assert.equal(log.length, 2);
+      }
+      await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+    } finally {
+      await host.stop();
+    }
+  }
+});
+
+test('direct factory opt-in cannot bypass an absent HQ qualification capability', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log), brokerPlugin({ enableBridgeQualification: true }),
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_no_authorizer';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    await assert.rejects(host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, {
+      model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}`,
+    }, { connection }), code('caller_mismatch'));
+    assert.equal(log.length, 2);
+  } finally {
+    await host.stop();
+  }
+});
+
+test('packaged broker rechecks HQ qualification capability on the live B request', async () => {
+  const log = [];
+  let enabled = true;
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, () => enabled), plugin,
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_revoked';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    enabled = false;
+    const frame = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+    await assert.rejects(host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection }),
+      code('caller_mismatch'));
+    assert.equal(log.length, 2);
+    enabled = true;
+    assert.deepEqual(await host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection }),
+      { model: frame.model });
+    assert.equal(log.at(-1)[0], 'qualify');
+  } finally {
+    await host.stop();
   }
 });
 
