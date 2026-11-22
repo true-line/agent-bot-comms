@@ -13,7 +13,7 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
-  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, brokerPlugin,
+  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES, brokerPlugin,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
@@ -363,6 +363,10 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT) => definePlugin({
         log.push(['bind_v2', input, connection]);
         return { bind_receipt: '2'.repeat(64) };
       },
+      async qualifyBridgeMessagesV2(input, { connection }, receipt) {
+        log.push(['qualify', input, connection, receipt]);
+        return { model: input.model };
+      },
       forgetBridgeConnection(connection, receipt) { log.push(['forget_bridge', connection, receipt]); },
     } };
   },
@@ -382,6 +386,9 @@ test('protected bridge bind uses the launch reservation on the same connection',
   assert.equal(host.provided(pkg.name).boundConnections(), 0);
   assert.equal(host.provided(pkg.name).boundBridgeConnections(), 1);
   await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+  await assert.rejects(host.brokerAccept('qualification.messages', {
+    model: 'qualification-model', prompt_sha256: `sha256:${'a'.repeat(64)}`,
+  }, { connection }), code('caller_mismatch'));
   await assert.rejects(host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection }), code('host.invalid_request'));
   await host.brokerClosed(connection);
   assert.deepEqual(log, [
@@ -389,6 +396,33 @@ test('protected bridge bind uses the launch reservation on the same connection',
     ['bind_v2', PROTECTED_FRAME, connection],
     ['forget_bridge', connection, bound.bind_receipt],
   ]);
+});
+
+test('bridge qualification route is opt-in and never grants member delivery', async () => {
+  const frame = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+  for (const enableBridgeQualification of [false, true]) {
+    const log = [];
+    const host = createTestHost({ plugins: [protectedAdmission(log), brokerPlugin({ enableBridgeQualification })] });
+    await host.start();
+    try {
+      const connection = 'b_v2';
+      await assert.rejects(host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection }), code('caller_mismatch'));
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+      const { bind_receipt } = await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+      const request = host.brokerAccept(BRIDGE_QUALIFICATION_MESSAGES, frame, { connection });
+      if (enableBridgeQualification) {
+        assert.deepEqual(await request, { model: frame.model });
+        assert.deepEqual(log.at(-1), ['qualify', frame, connection, bind_receipt]);
+      } else {
+        await assert.rejects(request, code('caller_mismatch'));
+        assert.equal(log.length, 2);
+      }
+      await assert.rejects(host.brokerAccept('qualification.messages', frame, { connection }), code('caller_mismatch'));
+      await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+    } finally {
+      await host.stop();
+    }
+  }
 });
 
 test('protected bridge rejects runtime IDs, malformed digests and v1 HQ challenges', async () => {
