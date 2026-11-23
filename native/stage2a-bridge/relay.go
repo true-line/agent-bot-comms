@@ -151,9 +151,36 @@ func peerMatches(conn *net.UnixConn, want uint32, check checkPeer) bool {
 }
 
 type brokerReply struct {
-	ID     string          `json:"id"`
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result"`
+	ID          string          `json:"id"`
+	OK          bool            `json:"ok"`
+	Result      json.RawMessage `json:"result"`
+	HostRefusal *struct {
+		Code          string `json:"code"`
+		Explanation   string `json:"explanation"`
+		CorrelationID string `json:"correlation_id"`
+	} `json:"host_refusal"`
+	Refusal json.RawMessage `json:"refusal"`
+}
+
+func decodeBrokerResult(data []byte, id, op string, out any) error {
+	var reply brokerReply
+	if decode(data, &reply) != nil || reply.ID != id {
+		return invalid
+	}
+	if !reply.OK {
+		if op == "bridge.member.observe.v3" && reply.HostRefusal != nil &&
+			reply.HostRefusal.Code == "host.launch_busy" &&
+			reply.HostRefusal.Explanation != "" &&
+			reply.HostRefusal.CorrelationID != "" &&
+			len(reply.Refusal) == 0 && len(reply.Result) == 0 {
+			return errObservationPending
+		}
+		return invalid
+	}
+	if reply.HostRefusal != nil || len(reply.Refusal) != 0 || decode(reply.Result, out) != nil {
+		return invalid
+	}
+	return nil
 }
 
 type broker struct {
@@ -228,11 +255,7 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 	case <-timer.C:
 		return invalid
 	case data := <-b.frames:
-		var reply brokerReply
-		if decode(data, &reply) != nil || reply.ID != id || !reply.OK || decode(reply.Result, out) != nil {
-			return invalid
-		}
-		return nil
+		return decodeBrokerResult(data, id, op, out)
 	}
 }
 

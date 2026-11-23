@@ -51,6 +51,14 @@ func runV3(ctx context.Context, authority v3Authority, key []byte,
 	}{receipt, relay.Socket}) != nil || status.Close() != nil {
 		return errors.New("could not report relay readiness")
 	}
+	// H holds each one-use observe call until A commits the signed two-child
+	// observation. Each accepted arm is only pending; ingress remains closed
+	// until aggregate Ready and a fresh per-CLI-peer proof are implemented.
+	for i := range authority.Members {
+		if _, _, err := b.armV3Member(ctx, authority, i); err != nil {
+			return errors.New("two-member bridge arm rejected")
+		}
+	}
 	for {
 		if listener.SetDeadline(time.Now().Add(250*time.Millisecond)) != nil {
 			return errors.New("relay listener deadline unavailable")

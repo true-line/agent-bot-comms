@@ -5,9 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 )
+
+var errObservationPending = errors.New("signed child observation pending")
 
 func randomNonce() (string, error) {
 	var bytes [32]byte
@@ -64,6 +67,31 @@ type v3ObserveReply struct {
 	Expires        time.Time `json:"expires_at"`
 }
 
+// H can return a definitive not-ready refusal while A is still observing
+// two inert children. It permits the identical nonce to retry; a transport
+// timeout is different, because a late reply may still occupy b.frames.
+func retryV3Observe(ctx context.Context, call func(int, *v3ObserveReply) error,
+	transportSettled func() bool) (v3ObserveReply, error) {
+	for attempt := 0; ; attempt++ {
+		var reply v3ObserveReply
+		if err := call(attempt, &reply); err == nil {
+			return reply, nil
+		} else if !errors.Is(err, errObservationPending) {
+			return v3ObserveReply{}, invalid
+		}
+		if ctx.Err() != nil || !transportSettled() {
+			return v3ObserveReply{}, invalid
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return v3ObserveReply{}, invalid
+		case <-timer.C:
+		}
+	}
+}
+
 // This consumes the existing v3 B→H broker stream. A successful arm reply is
 // pending only; it does not open relay ingress or claim aggregate Ready.
 func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
@@ -72,6 +100,12 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 		return nil, "", invalid
 	}
 	member := authority.Members[index]
+	deadline := time.Now().Add(20 * time.Second)
+	if authority.FD3.Expires.Before(deadline) {
+		deadline = authority.FD3.Expires
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	observeNonce, err := randomNonce()
 	if err != nil {
 		return nil, "", invalid
@@ -83,10 +117,11 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 		MemberSelector string      `json:"member_selector"`
 		Nonce          string      `json:"observe_nonce"`
 	}{"bridge.member.observe.v3.request", authority.FD3.Selectors, member.ID, member.Selector, observeNonce}
-	var observedReply v3ObserveReply
-	if b.call(ctx, "observe-"+strconv.Itoa(index), "bridge.member.observe.v3",
-		observeRequest, &observedReply) != nil ||
-		observedReply.Kind != "bridge.member.observe.v3.result" ||
+	observedReply, err := retryV3Observe(ctx, func(attempt int, out *v3ObserveReply) error {
+		return b.call(ctx, "observe-"+strconv.Itoa(index)+"-"+strconv.Itoa(attempt),
+			"bridge.member.observe.v3", observeRequest, out)
+	}, func() bool { return !b.waiting.Load() })
+	if err != nil || observedReply.Kind != "bridge.member.observe.v3.result" ||
 		observedReply.MemberID != member.ID || observedReply.MemberSelector != member.Selector ||
 		observedReply.Nonce != observeNonce || !validDigest(observedReply.Digest) ||
 		!time.Now().Before(observedReply.Expires) {
