@@ -72,15 +72,30 @@ func objectFields(data []byte, allowed ...string) map[string]json.RawMessage {
 	return result
 }
 
+// requestFields recognizes the first streaming Messages shape from stock
+// Claude ACP v0.109.0 on macOS and the existing eleven-field shape. The
+// assignment digest distinguishes particular requests in either shape.
+func requestFields(data []byte) (map[string]json.RawMessage, []string) {
+	request := objectFields(data, "context_management", "max_tokens", "messages", "metadata", "model",
+		"output_config", "safeguards", "stream", "system", "thinking", "tools")
+	switch {
+	case len(request) == 9 && request["output_config"] == nil && request["safeguards"] == nil:
+		return request, []string{"user"}
+	case len(request) == 11:
+		return request, []string{"user", "system"}
+	default:
+		return nil, nil
+	}
+}
+
 // normalizedRequest removes the only observed volatile stock-client field.
 // It validates every JSON object for duplicate keys, then serializes the
 // original raw values with metadata set to {}. All remaining body bytes are
 // committed by the Machine-signed request_sha256 in the B assignment.
 // Neither the raw body nor user_id is sent to HQ or the provider.
 func normalizedRequest(data []byte, config assignment) (string, error) {
-	fields := objectFields(data, "context_management", "max_tokens", "messages", "metadata", "model",
-		"output_config", "safeguards", "stream", "system", "thinking", "tools")
-	if len(fields) != 11 {
+	fields, roles := requestFields(data)
+	if fields == nil {
 		return "", invalid
 	}
 	var model string
@@ -88,14 +103,18 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	var messages []json.RawMessage
 	if json.Unmarshal(fields["model"], &model) != nil || model != config.Model ||
 		json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
-		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 2 {
+		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != len(roles) {
 		return "", invalid
 	}
-	for index, expected := range []string{"user", "system"} {
-		message := objectFields(messages[index], "role", "content", "output_config")
+	for index, expected := range roles {
+		allowed := []string{"role", "content"}
+		if index == 1 {
+			allowed = append(allowed, "output_config")
+		}
+		message := objectFields(messages[index], allowed...)
 		var role string
 		if message == nil || json.Unmarshal(message["role"], &role) != nil || role != expected ||
-			(index == 0 && len(message) != 2) || (index == 1 && len(message) != 3) {
+			len(message) != len(allowed) {
 			return "", invalid
 		}
 	}

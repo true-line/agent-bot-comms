@@ -34,7 +34,7 @@ type statusWriter struct{ status chan string }
 func (s statusWriter) Write(p []byte) (int, error) { s.status <- string(p); return len(p), nil }
 func (s statusWriter) Close() error                { return nil }
 
-func newFixture(t *testing.T, stale bool, providerDelay time.Duration) *fixture {
+func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBody string) *fixture {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "b-")
 	if err != nil {
@@ -52,7 +52,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration) *fixture 
 	cfg.BridgeUID, cfg.HQUID, cfg.RunnerUID = 322, 310, 321
 	cfg.Version = "stage2a-b-assignment/v2"
 	cfg.Model, cfg.MessagesQuery, cfg.HTTPHost = "probe", "beta=true", "unix"
-	cfg.RequestDigest = digest([]byte(strings.Replace(prompt, `"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"`+strings.Repeat("a", 64)+`\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"}`, `"metadata":{}`, 1)))
+	cfg.RequestDigest = digest([]byte(strings.Replace(requestBody, `"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"`+strings.Repeat("a", 64)+`\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"}`, `"metadata":{}`, 1)))
 	cfg.HeadersDigest = digest([]byte("accept:application/json\nanthropic-beta:fixture-beta\nanthropic-dangerous-direct-browser-access:true\nanthropic-version:2023-06-01\ncontent-type:application/json\nx-app:cli\nx-stainless-retry-count:0\n"))
 	cfg.ClientKeyDigest = digest([]byte("fixture-key"))
 	cfg.Expires = time.Now().Add(time.Minute)
@@ -194,7 +194,7 @@ func (f *fixture) httpWith(t *testing.T, body, extraHeaders, query string) (int,
 var prompt = `{"context_management":{},"max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"exact prompt"}]},{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}],"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"` + strings.Repeat("a", 64) + `\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"},"model":"probe","output_config":{},"safeguards":{},"stream":true,"system":[],"thinking":{},"tools":[]}`
 
 func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) {
-	f := newFixture(t, false, 0)
+	f := newFixture(t, false, 0, prompt)
 	f.ready(t)
 	f.peer.Store(322)
 	if status, _ := f.http(t, prompt); status != 0 {
@@ -266,8 +266,46 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) 
 	}
 }
 
+func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
+	// Match the nine fields and one user message from the macOS stock ACP
+	// v0.109.0 capture. System, tool, and user text are synthetic.
+	stock := strings.Replace(prompt, `,{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}`, "", 1)
+	stock = strings.Replace(stock, `"output_config":{},"safeguards":{},`, "", 1)
+	stock = strings.Replace(stock, `"system":[]`, `"system":[{"type":"text","text":"stock system instructions"}]`, 1)
+	stock = strings.Replace(stock, `"tools":[]`, `"tools":[{"name":"Read","input_schema":{"type":"object"}}]`, 1)
+	f := newFixture(t, false, 0, stock)
+	f.ready(t)
+	for name, body := range map[string]string{
+		"ancillary": strings.Replace(stock, `"context_management":{},`, `"output_config":{},`, 1),
+		"system":    strings.Replace(stock, "stock system instructions", "other instructions", 1),
+		"tool":      strings.Replace(stock, `"Read"`, `"Write"`, 1),
+		"duplicate": strings.Replace(stock, `"type":"text"`, `"type":"text","type":"text"`, 1),
+		"legacy":    prompt,
+	} {
+		if status, _ := f.http(t, body); status != 422 {
+			t.Errorf("%s got %d, want 422", name, status)
+		}
+	}
+	if status, body := f.http(t, stock); status != 200 || !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("stock request got %d %s", status, body)
+	}
+	if status, _ := f.http(t, stock); status != 409 {
+		t.Fatalf("stock replay got %d, want 409", status)
+	}
+	for _, expected := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp} {
+		if got := <-f.requests; got != expected {
+			t.Fatalf("broker operation %s, want %s", got, expected)
+		}
+	}
+	select {
+	case op := <-f.requests:
+		t.Fatalf("unexpected extra broker operation: %s", op)
+	default:
+	}
+}
+
 func TestStaleChallengeNeverCreatesRelay(t *testing.T) {
-	f := newFixture(t, true, 0)
+	f := newFixture(t, true, 0, prompt)
 	f.stopped(t, "broker bind rejected")
 	if _, err := os.Lstat(f.config.Relay.Path); !os.IsNotExist(err) {
 		t.Fatalf("unexpected relay: %v", err)
@@ -283,7 +321,7 @@ func TestStaleChallengeNeverCreatesRelay(t *testing.T) {
 }
 
 func TestBrokerDisconnectCleansUpOwnedSocket(t *testing.T) {
-	f := newFixture(t, false, 0)
+	f := newFixture(t, false, 0, prompt)
 	f.ready(t)
 	close(f.drop)
 	f.stopped(t, "broker disconnected")
@@ -293,7 +331,7 @@ func TestBrokerDisconnectCleansUpOwnedSocket(t *testing.T) {
 }
 
 func TestEndpointReplacementStopsRelayAndPreservesReplacement(t *testing.T) {
-	f := newFixture(t, false, 0)
+	f := newFixture(t, false, 0, prompt)
 	f.ready(t)
 	if err := os.Rename(f.config.Relay.Path, f.config.Relay.Path+".old"); err != nil {
 		t.Fatal(err)
@@ -315,7 +353,7 @@ func TestUnavailableVerifierFailsClosed(t *testing.T) {
 }
 
 func TestQualificationCanExceedBindAndRequestTimeout(t *testing.T) {
-	f := newFixture(t, false, ioTimeout+200*time.Millisecond)
+	f := newFixture(t, false, ioTimeout+200*time.Millisecond, prompt)
 	f.ready(t)
 	if status, body := f.http(t, prompt); status != 200 || !strings.Contains(body, "fixture response") {
 		t.Fatalf("delayed qualification got %d %s", status, body)
