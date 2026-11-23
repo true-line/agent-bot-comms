@@ -51,8 +51,12 @@ func (b *broker) serveCooperativePeer(ctx context.Context, conn *net.UnixConn,
 		}{member.ID, member.Launch, member.Selector, ready.SHA,
 			ready.Lease.SHA, ready.Lease.Sequence, admitted.MemberLease.SHA,
 			admitted.MemberLease.Sequence, admitted.Warrant.SHA, model, promptSHA}
-		return b.call(ctx, "cooperative-ingress-"+admitted.Warrant.SHA,
-			"bridge.relay.ingress.cooperative.v3", request, out)
+		if b.call(ctx, "cooperative-ingress-"+admitted.Warrant.SHA,
+			"bridge.relay.ingress.cooperative.v3", request, out) != nil ||
+			out.Text != member.ResponseText {
+			return invalid
+		}
+		return nil
 	}
 	return serveWithIngress(ctx, conn, config, relay, attempted, authorize, current)
 }
