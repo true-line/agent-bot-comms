@@ -186,11 +186,19 @@ func approvedEndpoint(bridge map[string]any, kind string, e endpoint, owner, gro
 // accept that profile. FD3 does not trust its own issuer: the installed pin
 // is opened separately by the native entry point before calling this parser.
 func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
-	var result v3Authority
-	if len(raw) == 0 || len(raw) > 16384 || decode(raw, &result.FD3) != nil {
-		return result, invalid
+	var frame v3FD3
+	if len(raw) == 0 || len(raw) > 16384 || decode(raw, &frame) != nil {
+		return v3Authority{}, invalid
 	}
-	f := result.FD3
+	return verifyMemberPolicy(frame, pin, now, nil)
+}
+
+// Cooperative B receives the same two-member policy only after its distinct
+// FD3 HMAC bind. The common member projection checks remain shared; the
+// profile, reservation purpose and endpoint records are mode-specific.
+func verifyMemberPolicy(f v3FD3, pin []byte, now time.Time,
+	cooperative *cooperativeBridgeAuthority) (v3Authority, error) {
+	result := v3Authority{FD3: f}
 	s := f.Selectors
 	uidOK := func(u uint32) bool { return u >= 300 && u <= 399 }
 	if f.Version != v3Version || f.MachinePinPath != v3PinPath || !now.Before(f.Expires) ||
@@ -228,10 +236,14 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 			"bridge", "members", "issued_at", "expires_at") {
 		return v3Authority{}, invalid
 	}
+	profile := "managed-protected"
+	if cooperative != nil {
+		profile = "managed-cooperative"
+	}
 	if field(a, "contract") != "machine/v3" || field(a, "kind") != "stage2a-member-set-assignment" ||
 		field(b, "contract") != "machine/v3" || field(b, "kind") != "stage2a-b-member-authority" ||
 		integer(a, "schema_version") != 1 || integer(b, "schema_version") != 1 ||
-		field(a, "profile_in_force") != "managed-protected" || field(b, "profile_in_force") != "managed-protected" {
+		field(a, "profile_in_force") != profile || field(b, "profile_in_force") != profile {
 		return v3Authority{}, invalid
 	}
 	for _, key := range []string{"host_id", "installation_id", "soul_id", "start_id", "hq_epoch", "plan_id", "plan_digest", "reservation_sha256", "owner_plan_member_set_sha256"} {
@@ -251,9 +263,12 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 	}
 	ba, okA := object(a["b_authority"])
 	bbAuth, okB := object(b["b_authority"])
+	wantPurpose, wantDigest := "agent-bot/stage2a-reservation/v3", s.Reservation
+	if cooperative != nil {
+		wantPurpose, wantDigest = cooperativeBridgePurpose, cooperative.AssignmentSHA
+	}
 	if !okA || !okB || !exactKeys(ba, "purpose", "envelope_sha256") || !sameValue(ba, bbAuth) ||
-		field(ba, "purpose") != "agent-bot/stage2a-reservation/v3" ||
-		field(ba, "envelope_sha256") != s.Reservation {
+		field(ba, "purpose") != wantPurpose || field(ba, "envelope_sha256") != wantDigest {
 		return v3Authority{}, invalid
 	}
 	bridgeA, okA := object(a["bridge"])
@@ -261,13 +276,23 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 	endpoints, endpointsOK := object(bridgeA["endpoints"])
 	if !okA || !okB || !endpointsOK || !exactKeys(bridgeA, "account", "uid", "gid", "endpoints") ||
 		!exactKeys(endpoints, "broker", "member", "relay") || !sameValue(bridgeA, bridgeB) ||
-		integer(bridgeA, "uid") != int64(f.BridgeUID) || integer(bridgeA, "gid") != int64(f.BridgeUID) ||
-		!approvedEndpoint(bridgeA, "broker", f.Broker, f.HQUID, f.BridgeUID, f.BridgeUID) ||
-		!approvedEndpoint(bridgeA, "relay", f.Relay, f.BridgeUID, f.RunnerUID, f.RunnerUID) {
+		integer(bridgeA, "uid") != int64(f.BridgeUID) || integer(bridgeA, "gid") != int64(f.BridgeUID) {
+		return v3Authority{}, invalid
+	}
+	if cooperative == nil {
+		if !approvedEndpoint(bridgeA, "broker", f.Broker, f.HQUID, f.BridgeUID, f.BridgeUID) ||
+			!approvedEndpoint(bridgeA, "relay", f.Relay, f.BridgeUID, f.RunnerUID, f.RunnerUID) {
+			return v3Authority{}, invalid
+		}
+	} else if !sameValue(endpoints["broker"], cooperative.BrokerRecord) ||
+		!sameValue(endpoints["member"], cooperative.MemberRecord) ||
+		!sameValue(endpoints["relay"], cooperative.RelayRecord) ||
+		!cooperativeEndpointIdentityMatches(cooperative.BrokerRecord, f.Broker, true) ||
+		!cooperativeEndpointIdentityMatches(cooperative.RelayRecord, f.Relay, false) {
 		return v3Authority{}, invalid
 	}
 	memberEndpoint, memberOK := object(endpoints["member"])
-	if !memberOK || !exactKeys(memberEndpoint, "directory", "socket_path", "owner_uid", "group_gid", "dir_mode", "socket_mode", "peer_uids") ||
+	if !memberOK ||
 		!filepath.IsAbs(field(memberEndpoint, "socket_path")) ||
 		filepath.Clean(field(memberEndpoint, "socket_path")) != field(memberEndpoint, "socket_path") ||
 		filepath.Dir(field(memberEndpoint, "socket_path")) != field(memberEndpoint, "directory") ||
@@ -277,11 +302,17 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 		integer(memberEndpoint, "dir_mode") != 02750 || integer(memberEndpoint, "socket_mode") != 0660 {
 		return v3Authority{}, invalid
 	}
-	memberPeers, peersOK := array(memberEndpoint["peer_uids"])
-	if !peersOK || len(memberPeers) != 2 || !sameValue(memberPeers, []any{
-		json.Number(strconv.FormatUint(uint64(f.RunnerUID), 10)),
-		json.Number(strconv.FormatUint(uint64(f.BridgeUID), 10)),
-	}) {
+	if cooperative == nil {
+		memberPeers, peersOK := array(memberEndpoint["peer_uids"])
+		if !exactKeys(memberEndpoint, "directory", "socket_path", "owner_uid", "group_gid", "dir_mode", "socket_mode", "peer_uids") ||
+			!peersOK || len(memberPeers) != 2 || !sameValue(memberPeers, []any{
+			json.Number(strconv.FormatUint(uint64(f.RunnerUID), 10)),
+			json.Number(strconv.FormatUint(uint64(f.BridgeUID), 10)),
+		}) {
+			return v3Authority{}, invalid
+		}
+	} else if !sameValue(memberEndpoint, cooperative.MemberRecord) ||
+		integer(memberEndpoint, "expected_peer_uid") != int64(f.BridgeUID) {
 		return v3Authority{}, invalid
 	}
 	assignMembers, okA := array(a["members"])

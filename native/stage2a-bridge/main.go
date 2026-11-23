@@ -47,9 +47,9 @@ func entry() error {
 			return fmt.Errorf("launch descriptor deadline unavailable")
 		}
 	}
-	data, err := io.ReadAll(io.LimitReader(assignmentFile, 16385))
+	data, err := io.ReadAll(io.LimitReader(assignmentFile, cooperativeFD3MaxBytes+1))
 	var probe map[string]json.RawMessage
-	if err != nil || len(data) > 16384 || decode(data, &probe) != nil {
+	if err != nil || len(data) > cooperativeFD3MaxBytes || decode(data, &probe) != nil {
 		return fmt.Errorf("invalid launch assignment")
 	}
 	assignmentFile.Close()
@@ -60,13 +60,17 @@ func entry() error {
 	var bridgeUID uint32
 	var v2 assignment
 	var v3 v3Authority
+	var cooperative cooperativeBridgeAuthority
 	switch version {
 	case "stage2a-b-assignment/v2":
-		if decode(data, &v2) != nil || v2.validate() != nil {
+		if len(data) > 16384 || decode(data, &v2) != nil || v2.validate() != nil {
 			return fmt.Errorf("invalid launch assignment")
 		}
 		bridgeUID = v2.BridgeUID
 	case v3Version:
+		if len(data) > 16384 {
+			return fmt.Errorf("invalid signed launch assignment")
+		}
 		pin, err := readMachinePin()
 		if err != nil {
 			return fmt.Errorf("Machine authority pin unavailable")
@@ -76,6 +80,16 @@ func entry() error {
 			return fmt.Errorf("invalid signed launch assignment")
 		}
 		bridgeUID = v3.FD3.BridgeUID
+	case cooperativeStartVersion:
+		pin, err := readMachinePin()
+		if err != nil {
+			return fmt.Errorf("Machine authority pin unavailable")
+		}
+		cooperative, err = verifyCooperativeFD3(data, pin, time.Now())
+		if err != nil {
+			return fmt.Errorf("invalid signed cooperative launch assignment")
+		}
+		bridgeUID = cooperative.BridgeUID
 	default:
 		return fmt.Errorf("invalid launch assignment")
 	}
@@ -93,6 +107,9 @@ func entry() error {
 	defer stop()
 	if version == v3Version {
 		return runV3(ctx, v3, key, statusFile, peerUID)
+	}
+	if version == cooperativeStartVersion {
+		return runCooperative(ctx, cooperative, key, statusFile, peerUID)
 	}
 	return run(ctx, v2, key, statusFile, peerUID)
 }

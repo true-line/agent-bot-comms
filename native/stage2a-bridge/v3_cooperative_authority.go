@@ -31,9 +31,20 @@ type cooperativeBridgeAuthority struct {
 	BridgeUID      uint32
 	RunnerUID      uint32
 	HQUID          uint32
+	HostID         string
+	SoulID         string
+	Installation   string
+	Start          string
+	Launch         string
+	Plan           string
+	PlanDigest     string
+	Epoch          string
 	BrokerPath     string
 	MemberPath     string
 	RelayPath      string
+	BrokerRecord   map[string]any
+	MemberRecord   map[string]any
+	RelayRecord    map[string]any
 	ReservationSHA string
 	AssignmentSHA  string
 	Expires        time.Time
@@ -156,6 +167,7 @@ func verifyCooperativeBridgePair(reservationEnvelope, bridgeEnvelope, pin []byte
 	}
 	a, ok := object(reservation["assignment"])
 	if !ok || !idPattern.MatchString(field(a, "installation_id")) ||
+		!idPattern.MatchString(field(a, "soul_id")) ||
 		!startPattern.MatchString(field(a, "start_id")) ||
 		!launchPattern.MatchString(field(a, "launch_id")) ||
 		!idPattern.MatchString(field(a, "plan_id")) ||
@@ -246,7 +258,14 @@ func verifyCooperativeBridgePair(reservationEnvelope, bridgeEnvelope, pin []byte
 	}
 	return cooperativeBridgeAuthority{BridgeUID: uint32(bridgeUID),
 		RunnerUID: uint32(runnerUID), HQUID: uint32(hqUID),
+		HostID: field(reservation, "host_id"), SoulID: field(a, "soul_id"),
+		Installation: field(a, "installation_id"), Start: field(a, "start_id"),
+		Launch: field(a, "launch_id"), Plan: field(a, "plan_id"),
+		PlanDigest: field(a, "plan_digest"), Epoch: field(a, "hq_epoch"),
 		BrokerPath: broker, MemberPath: member, RelayPath: relay,
+		BrokerRecord:   endpoints["broker"].(map[string]any),
+		MemberRecord:   endpoints["member"].(map[string]any),
+		RelayRecord:    endpoints["relay"].(map[string]any),
 		ReservationSHA: digest(reservationEnvelope), AssignmentSHA: digest(bridgeEnvelope),
 		Expires: expires}, nil
 }

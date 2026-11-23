@@ -242,7 +242,7 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 		return invalid
 	}
 	timeout := ioTimeout
-	if op == relayIngressOp {
+	if op == relayIngressOp || op == "bridge.member-policy.v3" {
 		timeout = relayIngressTimeout
 	}
 	timer := time.NewTimer(timeout)
