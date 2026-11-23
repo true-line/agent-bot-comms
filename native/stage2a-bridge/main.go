@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"slices"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -46,13 +48,39 @@ func entry() error {
 		}
 	}
 	data, err := io.ReadAll(io.LimitReader(assignmentFile, 16385))
-	var config assignment
-	if err != nil || len(data) > 16384 || decode(data, &config) != nil || config.validate() != nil {
+	var probe map[string]json.RawMessage
+	if err != nil || len(data) > 16384 || decode(data, &probe) != nil {
 		return fmt.Errorf("invalid launch assignment")
 	}
 	assignmentFile.Close()
-	if uint32(os.Getuid()) != config.BridgeUID || uint32(os.Geteuid()) != config.BridgeUID ||
-		uint32(os.Getgid()) != config.BridgeUID || uint32(os.Getegid()) != config.BridgeUID {
+	var version string
+	if json.Unmarshal(probe["version"], &version) != nil {
+		return fmt.Errorf("invalid launch assignment")
+	}
+	var bridgeUID uint32
+	var v2 assignment
+	var v3 v3Authority
+	switch version {
+	case "stage2a-b-assignment/v2":
+		if decode(data, &v2) != nil || v2.validate() != nil {
+			return fmt.Errorf("invalid launch assignment")
+		}
+		bridgeUID = v2.BridgeUID
+	case v3Version:
+		pin, err := readMachinePin()
+		if err != nil {
+			return fmt.Errorf("Machine authority pin unavailable")
+		}
+		v3, err = verifyV3FD3(data, pin, time.Now())
+		if err != nil {
+			return fmt.Errorf("invalid signed launch assignment")
+		}
+		bridgeUID = v3.FD3.BridgeUID
+	default:
+		return fmt.Errorf("invalid launch assignment")
+	}
+	if uint32(os.Getuid()) != bridgeUID || uint32(os.Geteuid()) != bridgeUID ||
+		uint32(os.Getgid()) != bridgeUID || uint32(os.Getegid()) != bridgeUID {
 		return fmt.Errorf("unexpected bridge identity")
 	}
 	key, err := io.ReadAll(io.LimitReader(proofFile, 33))
@@ -63,5 +91,8 @@ func entry() error {
 	proofFile.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return run(ctx, config, key, statusFile, peerUID)
+	if version == v3Version {
+		return runV3(ctx, v3, key, statusFile, peerUID)
+	}
+	return run(ctx, v2, key, statusFile, peerUID)
 }

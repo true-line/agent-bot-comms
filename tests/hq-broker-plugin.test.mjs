@@ -13,8 +13,9 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
-  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES,
-  BRIDGE_RELAY_INGRESS, brokerPlugin,
+  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2,
+  BRIDGE_BIND_V3, BRIDGE_BIND_CHALLENGE_V3, BRIDGE_QUALIFICATION_MESSAGES,
+  BRIDGE_RELAY_INGRESS, STAGE2A_RELAY_PEER_CHALLENGE, brokerPlugin,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
@@ -349,9 +350,16 @@ const PROTECTED_SCOPE = Object.freeze({
   reservation_digest: `sha256:${'d'.repeat(64)}`,
 });
 const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
+const V3_CONTEXT = 'agent-bot-stage2a-bridge-bind-v3';
+const V3_SCOPE = Object.freeze({ installation_id: 'install_1', start_id: `st_${'a'.repeat(24)}`,
+  plan_id: 'plan_1', plan_digest: 'c'.repeat(64), reservation_digest: `sha256:${'d'.repeat(64)}`,
+  assignment_envelope_sha256: `sha256:${'e'.repeat(64)}`,
+  authority_envelope_sha256: `sha256:${'f'.repeat(64)}`,
+  member_selectors_sha256: `sha256:${'1'.repeat(64)}` });
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
 
-const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false, relayIngressEnabled = false) => definePlugin({
+const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false,
+  relayIngressEnabled = false, peerEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
@@ -359,10 +367,24 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
         ? qualificationEnabled() : qualificationEnabled,
       bridgeRelayIngressEnabledV2: () => typeof relayIngressEnabled === 'function'
         ? relayIngressEnabled() : relayIngressEnabled,
+      stage2aRelayPeerChallengeEnabled: () => peerEnabled,
+      async stage2aRelayPeerChallenge(input, { connection }, receipt) {
+        log.push(['live_peer', input, connection, receipt]);
+        return { verdict: 'verified' };
+      },
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
           hq_epoch: '1'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async bridgeBindChallengeV3(input, { connection }) {
+        log.push(['challenge_v3', input, connection]);
+        return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context: V3_CONTEXT,
+          hq_epoch: '1'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async verifyBridgeBindingV3(input, { connection }) {
+        log.push(['bind_v3', input, connection]);
+        return { bind_receipt: '3'.repeat(64) };
       },
       async verifyBridgeBindingV2(input, { connection }) {
         log.push(['bind_v2', input, connection]);
@@ -424,6 +446,45 @@ test('packaged B relay ingress stays closed until HQ supplies its private relay 
   } finally {
     await host.stop();
   }
+});
+
+test('live peer challenge refuses a v2 bridge even when both optional gates are enabled', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, false, true),
+    brokerPlugin({ enableRelayPeerChallenge: true }),
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_v2_only';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    await assert.rejects(host.brokerAccept(STAGE2A_RELAY_PEER_CHALLENGE,
+      { rpc_id: `rpc_${'a'.repeat(32)}` }, { connection }), code('caller_mismatch'));
+    assert.equal(log.some(([kind]) => kind === 'live_peer'), false);
+  } finally { await host.stop(); }
+});
+
+test('v3 bridge binds eight exact selectors then routes live peer on that bound connection', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log, PROTECTED_CONTEXT, false, false, true),
+    brokerPlugin({ enableRelayPeerChallenge: true })] });
+  await host.start();
+  try {
+    const connection = 'b_v3';
+    await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3,
+      { ...V3_SCOPE, launch_id: `ln_${'a'.repeat(24)}` }, { connection }), code('host.invalid_request'));
+    assert.equal(log.some(([kind]) => kind === 'challenge_v3'), false);
+    const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+    assert.equal(challenge.context, V3_CONTEXT);
+    const receipt = await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+    assert.equal(receipt.bind_receipt, '3'.repeat(64));
+    const frame = { rpc_id: `rpc_${'a'.repeat(32)}` };
+    assert.deepEqual(await host.brokerAccept(STAGE2A_RELAY_PEER_CHALLENGE, frame, { connection }),
+      { verdict: 'verified' });
+    assert.deepEqual(log.at(-1), ['live_peer', frame, connection, receipt.bind_receipt]);
+    await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+  } finally { await host.stop(); }
 });
 
 test('protected bridge bind uses the launch reservation on the same connection', async () => {
