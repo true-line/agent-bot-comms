@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-11-23
+
+### Added
+
+- The packaged HQ broker exposes the Stage 2a B relay ingress route only for
+  a dedicated v2-bound bridge with its receipt and an enabled HQ capability.
+  Comms forwards the bound request to HQ for live assignment and payload
+  validation; member and unbound callers remain refused. Physical qualification
+  still requires the matching HQ release and host evidence.
+
 ## [0.5.9] - 2026-11-22
 
 ### Fixed

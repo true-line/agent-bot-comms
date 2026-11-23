@@ -28,7 +28,7 @@ import { OWNER_GRANT_LIMITS } from '../lib/owner-scoped-grants.mjs';
 import * as skill from '../lib/skill.mjs';
 import { pairOwnDaemon, repairLauncher, setup, waitForBroker, pairDaemonWithAgentBot } from '../lib/setup.mjs';
 
-const VERSION = '0.5.9';
+const VERSION = '0.5.10';
 
 // Each row owns its positional arity and value flags; help uses the same schema.
 const COMMANDS = [
