@@ -93,7 +93,11 @@ func jcsValue(value any, out *bytes.Buffer) error {
 }
 
 func canonicalSignedJSON(data []byte) (map[string]any, error) {
-	if len(data) == 0 || len(data) > 16384 {
+	return canonicalSignedJSONBounded(data, 16384)
+}
+
+func canonicalSignedJSONBounded(data []byte, maxBytes int) (map[string]any, error) {
+	if len(data) == 0 || len(data) > maxBytes || maxBytes <= 0 {
 		return nil, invalid
 	}
 	scan := json.NewDecoder(bytes.NewReader(data))
