@@ -3,10 +3,12 @@
 package main
 
 /*
-#cgo LDFLAGS: -lbsm
+#cgo LDFLAGS: -lbsm -lproc
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <bsm/libbsm.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
 
 static int read_peer_audit_token(int fd, uid_t *uid, pid_t *pid, int *pid_version) {
 	audit_token_t token;
@@ -18,6 +20,19 @@ static int read_peer_audit_token(int fd, uid_t *uid, pid_t *pid, int *pid_versio
 	*uid = audit_token_to_euid(token);
 	*pid = audit_token_to_pid(token);
 	*pid_version = audit_token_to_pidversion(token);
+	return 0;
+}
+
+static int read_process_start(pid_t pid, pid_t *observed_pid, pid_t *parent_pid,
+                              uint64_t *start_seconds, uint64_t *start_micros) {
+	struct proc_bsdinfo info;
+	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
+		return -1;
+	}
+	*observed_pid = info.pbi_pid;
+	*parent_pid = info.pbi_ppid;
+	*start_seconds = info.pbi_start_tvsec;
+	*start_micros = info.pbi_start_tvusec;
 	return 0;
 }
 */
@@ -35,6 +50,18 @@ type peerProcessIdentity struct {
 	UID        uint32
 	PID        int
 	PIDVersion int
+}
+
+// peerProcessSnapshot is a live kernel view of the socket peer and its direct
+// parent. A later authority check must compare it with Machine's signed ACP
+// parent and live-peer attestation, then obtain a fresh snapshot before use.
+type peerProcessSnapshot struct {
+	Peer               peerProcessIdentity
+	StartSeconds       uint64
+	StartMicros        uint64
+	ParentPID          int
+	ParentStartSeconds uint64
+	ParentStartMicros  uint64
 }
 
 func peerIdentity(conn *net.UnixConn) (peerProcessIdentity, error) {
@@ -56,4 +83,32 @@ func peerIdentity(conn *net.UnixConn) (peerProcessIdentity, error) {
 		return peerProcessIdentity{}, errors.New("kernel peer identity unavailable")
 	}
 	return peerProcessIdentity{UID: uint32(uid), PID: int(pid), PIDVersion: int(pidVersion)}, nil
+}
+
+func observePeerProcess(conn *net.UnixConn) (peerProcessSnapshot, error) {
+	peer, err := peerIdentity(conn)
+	if err != nil {
+		return peerProcessSnapshot{}, err
+	}
+	var observedPID, parentPID C.pid_t
+	var startSeconds, startMicros C.uint64_t
+	if C.read_process_start(C.pid_t(peer.PID), &observedPID, &parentPID, &startSeconds, &startMicros) != 0 ||
+		int(observedPID) != peer.PID || parentPID <= 1 || startSeconds == 0 || startMicros >= 1000000 {
+		return peerProcessSnapshot{}, errors.New("kernel peer process unavailable")
+	}
+	var observedParentPID, grandparentPID C.pid_t
+	var parentStartSeconds, parentStartMicros C.uint64_t
+	if C.read_process_start(parentPID, &observedParentPID, &grandparentPID,
+		&parentStartSeconds, &parentStartMicros) != 0 || observedParentPID != parentPID ||
+		parentStartSeconds == 0 || parentStartMicros >= 1000000 {
+		return peerProcessSnapshot{}, errors.New("kernel peer parent unavailable")
+	}
+	if current, err := peerIdentity(conn); err != nil || current != peer {
+		return peerProcessSnapshot{}, errors.New("kernel peer changed")
+	}
+	return peerProcessSnapshot{
+		Peer: peer, StartSeconds: uint64(startSeconds), StartMicros: uint64(startMicros),
+		ParentPID: int(parentPID), ParentStartSeconds: uint64(parentStartSeconds),
+		ParentStartMicros: uint64(parentStartMicros),
+	}, nil
 }

@@ -82,4 +82,12 @@ func TestPeerAuditTokenDistinguishesSameUIDProcesses(t *testing.T) {
 		childIdentity.PID == localIdentity.PID || childIdentity.PIDVersion <= 0 {
 		t.Fatalf("child peer identity = %+v, local = %+v, child PID = %d", childIdentity, localIdentity, cmd.Process.Pid)
 	}
+	snapshot, err := observePeerProcess(childServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Peer != childIdentity || snapshot.ParentPID != os.Getpid() ||
+		snapshot.StartSeconds == 0 || snapshot.ParentStartSeconds == 0 {
+		t.Fatalf("child process snapshot = %+v, want parent PID %d", snapshot, os.Getpid())
+	}
 }

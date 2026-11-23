@@ -13,6 +13,19 @@ type peerProcessIdentity struct {
 	PIDVersion int
 }
 
+type peerProcessSnapshot struct {
+	Peer               peerProcessIdentity
+	StartSeconds       uint64
+	StartMicros        uint64
+	ParentPID          int
+	ParentStartSeconds uint64
+	ParentStartMicros  uint64
+}
+
 func peerIdentity(*net.UnixConn) (peerProcessIdentity, error) {
 	return peerProcessIdentity{}, errors.New("Darwin native peer identity unavailable")
+}
+
+func observePeerProcess(*net.UnixConn) (peerProcessSnapshot, error) {
+	return peerProcessSnapshot{}, errors.New("Darwin native peer process unavailable")
 }
