@@ -93,7 +93,7 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 			return errors.New("cooperative authority or endpoint expired")
 		}
 	}
-	_, readyExpiry, err := b.cooperativeReady(ctx, authority, policy, observation,
+	ready, err := b.cooperativeReady(ctx, authority, policy, observation,
 		armDigests, receipt, relay)
 	if err != nil {
 		return errors.New("cooperative aggregate Ready rejected")
@@ -102,9 +102,18 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 		if ctx.Err() != nil {
 			return nil
 		}
+		if time.Until(ready.Lease.Expires) < 2*time.Second {
+			lease, err := b.renewCooperativeBLive(ctx, authority, policy, ready, relay)
+			if err != nil {
+				return errors.New("cooperative B live lease rejected")
+			}
+			ready.Lease = lease
+		}
 		if !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
 			!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
-			!time.Now().Before(readyExpiry) {
+			currentCooperativeRelayBirth(relay, ready.BirthNS) != nil ||
+			!time.Now().Before(ready.Expires) ||
+			!time.Now().Before(ready.Lease.Expires) {
 			return errors.New("cooperative authority or endpoint expired")
 		}
 		if listener.SetDeadline(time.Now().Add(250*time.Millisecond)) != nil {

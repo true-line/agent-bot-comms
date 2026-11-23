@@ -65,34 +65,34 @@ func TestCooperativeBObservedJoinsFD5RelayAndSelf(t *testing.T) {
 	self := func(bridge, launcher map[string]any) bool {
 		return integer(bridge, "pid") == 4002 && integer(launcher, "pid") == 4001
 	}
-	sha, expiry, err := verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth,
+	observed, err := verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth,
 		base.Add(time.Second), self)
-	if err != nil || !validDigest(sha) || !base.Before(expiry) {
+	if err != nil || !validDigest(observed.SHA) || !base.Before(observed.Expires) {
 		t.Fatalf("signed B observation refused: %v", err)
 	}
-	for name, check := range map[string]func() (string, time.Time, error){
-		"wrong FD5 receipt": func() (string, time.Time, error) {
+	for name, check := range map[string]func() (cooperativeObservedB, error){
+		"wrong FD5 receipt": func() (cooperativeObservedB, error) {
 			return verifyCooperativeBObserved(encoded, a, pin, "sha256:"+strings.Repeat("0", 64),
 				relay, birth, base.Add(time.Second), self)
 		},
-		"wrong socket birthtime": func() (string, time.Time, error) {
+		"wrong socket birthtime": func() (cooperativeObservedB, error) {
 			return verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth+1,
 				base.Add(time.Second), self)
 		},
-		"wrong Machine pin": func() (string, time.Time, error) {
+		"wrong Machine pin": func() (cooperativeObservedB, error) {
 			return verifyCooperativeBObserved(encoded, a, append([]byte(nil), pin[:31]...), receipt,
 				relay, birth, base.Add(time.Second), self)
 		},
-		"changed self process": func() (string, time.Time, error) {
+		"changed self process": func() (cooperativeObservedB, error) {
 			return verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth,
 				base.Add(time.Second), func(map[string]any, map[string]any) bool { return false })
 		},
-		"expired": func() (string, time.Time, error) {
-			return verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth, expiry, self)
+		"expired": func() (cooperativeObservedB, error) {
+			return verifyCooperativeBObserved(encoded, a, pin, receipt, relay, birth, observed.Expires, self)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := check(); err == nil {
+			if _, err := check(); err == nil {
 				t.Fatal("changed B observation accepted")
 			}
 		})

@@ -17,20 +17,27 @@ type cooperativeReadyReply struct {
 	LeaseSequence          uint64 `json:"lease_sequence"`
 }
 
+type cooperativeReadyState struct {
+	SHA      string
+	Expires  time.Time
+	Observed cooperativeObservedB
+	Lease    cooperativeBLive
+	BirthNS  int64
+}
+
 // The first Ready call travels on the same HMAC-bound B→H connection used
-// for policy and both arm rows. Its B lease remains unusable until a separate
-// signature and short-expiry verifier accepts it.
+// for policy and both arm rows. Its separate signed B lease is required even
+// while relay ingress stays closed pending member and CLI peer proof.
 func (b *broker) cooperativeReady(ctx context.Context, a cooperativeBridgeAuthority,
 	policy v3Authority, observation v3Observation, armDigests [2]string,
-	bindReceipt string, relay endpoint) (string, time.Time, error) {
-	var empty time.Time
+	bindReceipt string, relay endpoint) (cooperativeReadyState, error) {
 	if !cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
 		!cooperativeEndpointCurrent(a.RelayRecord, relay) {
-		return "", empty, invalid
+		return cooperativeReadyState{}, invalid
 	}
 	nonce, err := randomBase64Nonce()
 	if err != nil {
-		return "", empty, invalid
+		return cooperativeReadyState{}, invalid
 	}
 	request := struct {
 		ChildObservationSHA string `json:"child_observation_envelope_sha256"`
@@ -44,27 +51,36 @@ func (b *broker) cooperativeReady(ctx context.Context, a cooperativeBridgeAuthor
 		result.LeaseEnvelope == "" ||
 		!cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
 		!cooperativeEndpointCurrent(a.RelayRecord, relay) {
-		return "", empty, invalid
+		return cooperativeReadyState{}, invalid
 	}
 	birth, err := cooperativeBirthtimeNS(relay.Path)
 	if err != nil {
-		return "", empty, invalid
+		return cooperativeReadyState{}, invalid
 	}
-	observedSHA, observedExpiry, err := verifyCooperativeBObserved(
+	observed, err := verifyCooperativeBObserved(
 		result.BridgeObservedEnvelope, a, policy.Pin[:], bindReceipt,
 		relay, birth, time.Now(), cooperativeSelfMatches)
-	if err != nil || observedSHA != result.BridgeObservedSHA {
-		return "", empty, invalid
+	if err != nil || observed.SHA != result.BridgeObservedSHA {
+		return cooperativeReadyState{}, invalid
 	}
 	readySHA, readyExpiry, err := verifyCooperativeReady(result.ReadyEnvelope,
-		policy, observation, armDigests, observedSHA, time.Now())
+		policy, observation, armDigests, observed.SHA, time.Now())
 	if err != nil || readySHA != result.ReadySHA {
-		return "", empty, invalid
+		return cooperativeReadyState{}, invalid
 	}
-	if observedExpiry.Before(readyExpiry) {
-		readyExpiry = observedExpiry
+	if observed.Expires.Before(readyExpiry) {
+		readyExpiry = observed.Expires
 	}
-	return readySHA, readyExpiry, nil
+	lease, err := verifyCooperativeBLive(result.LeaseEnvelope, a, policy, observed,
+		readySHA, nonce, 0, readyExpiry, relay, time.Now(),
+		func(e endpoint) bool { return cooperativeEndpointCurrent(a.RelayRecord, e) },
+		cooperativeSelfMatches)
+	if err != nil || lease.SHA != result.LeaseSHA || lease.Sequence != int64(result.LeaseSequence) ||
+		!cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
+		currentCooperativeRelayBirth(relay, birth) != nil {
+		return cooperativeReadyState{}, invalid
+	}
+	return cooperativeReadyState{readySHA, readyExpiry, observed, lease, birth}, nil
 }
 
 // The A signature joins B's two exact provisional arm rows to the observed

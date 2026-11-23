@@ -35,6 +35,17 @@ func cooperativeEndpointCurrent(record map[string]any, actual endpoint) bool {
 	return err == nil && got == want
 }
 
+func currentCooperativeRelayBirth(relay endpoint, want int64) error {
+	if want <= 0 || !relay.current() {
+		return invalid
+	}
+	got, err := cooperativeBirthtimeNS(relay.Path)
+	if err != nil || got != want {
+		return invalid
+	}
+	return nil
+}
+
 // The signed parent tuple is checked before B opens either assigned socket.
 // A created relay has no socket inode yet; the broker and member must exist.
 func cooperativeRuntimeEndpoint(record map[string]any, created bool) (endpoint, error) {
