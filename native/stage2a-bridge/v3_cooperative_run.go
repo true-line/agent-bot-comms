@@ -72,6 +72,19 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 	if err != nil || !time.Now().Before(policy.FD3.Expires) {
 		return errors.New("cooperative signed member policy rejected")
 	}
+	// H holds each observe call until A has signed the two-child observation.
+	// Both arm acknowledgments are provisional; no relay connection is served
+	// without a later, independently verified aggregate Ready and live peer.
+	for i := range policy.Members {
+		if _, _, err := b.armCooperativeMember(ctx, policy, i); err != nil {
+			return errors.New("cooperative two-member bridge arm rejected")
+		}
+		if !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
+			!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
+			!time.Now().Before(policy.FD3.Expires) {
+			return errors.New("cooperative authority or endpoint expired")
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return nil
