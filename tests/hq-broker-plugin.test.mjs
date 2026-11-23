@@ -13,7 +13,8 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
-  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES, brokerPlugin,
+  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES,
+  BRIDGE_RELAY_INGRESS, brokerPlugin,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
@@ -350,12 +351,14 @@ const PROTECTED_SCOPE = Object.freeze({
 const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
 
-const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false) => definePlugin({
+const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false, relayIngressEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
       bridgeQualificationEnabledV2: () => typeof qualificationEnabled === 'function'
         ? qualificationEnabled() : qualificationEnabled,
+      bridgeRelayIngressEnabledV2: () => typeof relayIngressEnabled === 'function'
+        ? relayIngressEnabled() : relayIngressEnabled,
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
@@ -365,13 +368,62 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
         log.push(['bind_v2', input, connection]);
         return { bind_receipt: '2'.repeat(64) };
       },
+      async verifyBinding(input, { connection }) {
+        log.push(['member_bind', input, connection]);
+        return { runtime_id: input.runtime_id, member_id: 'member_1', role: 'agent' };
+      },
       async qualifyBridgeMessagesV2(input, { connection }, receipt) {
         log.push(['qualify', input, connection, receipt]);
         return { model: input.model };
       },
+      async relayBridgeIngressV2(input, { connection }, receipt) {
+        log.push(['relay_ingress', input, connection, receipt]);
+        return { accepted: true };
+      },
       forgetBridgeConnection(connection, receipt) { log.push(['forget_bridge', connection, receipt]); },
     } };
   },
+});
+
+test('B relay ingress delegates opaque frames only over a live v2 bridge binding', async () => {
+  const log = [];
+  const frame = { opaque_frame: 'base64:fixture', sequence: 7 };
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, true),
+    brokerPlugin({ enableBridgeRelayIngress: true }),
+  ] });
+  await host.start();
+  try {
+    const b = 'b_relay';
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS, frame, { connection: b }), code('caller_mismatch'));
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection: b });
+    const { bind_receipt } = await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection: b });
+    assert.deepEqual(await host.brokerAccept(BRIDGE_RELAY_INGRESS, frame, { connection: b }), { accepted: true });
+    assert.deepEqual(log.at(-1), ['relay_ingress', frame, b, bind_receipt]);
+    await assert.rejects(host.brokerAccept('task.commit', {}, { connection: b }), code('caller_mismatch'));
+
+    const member = 'r_member';
+    await host.brokerAccept('bind', { runtime_id: 'rt_member', proof: 'proof' }, { connection: member });
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS, frame, { connection: member }), code('caller_mismatch'));
+    assert.equal(log.filter(([kind]) => kind === 'relay_ingress').length, 1);
+  } finally {
+    await host.stop();
+  }
+});
+
+test('packaged B relay ingress stays closed until HQ supplies its private relay capability', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log), plugin] });
+  await host.start();
+  try {
+    const connection = 'b_without_hq_relay';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS, { opaque_frame: 'base64:fixture' }, { connection }), code('caller_mismatch'));
+    assert.equal(log.some(([kind]) => kind === 'relay_ingress'), false);
+  } finally {
+    await host.stop();
+  }
 });
 
 test('protected bridge bind uses the launch reservation on the same connection', async () => {
