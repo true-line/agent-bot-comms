@@ -120,3 +120,24 @@ func TestCooperativePeerWarrantJoinsAcceptedCLIToSignedMember(t *testing.T) {
 		t.Fatal("expired peer warrant accepted")
 	}
 }
+
+func TestCooperativeIngressRefusesTextOutsideSignedMemberPolicy(t *testing.T) {
+	a, pair, pin, base := policyFixture(t)
+	policy, err := verifyCooperativePolicy(pair, a, pin,
+		fixtureEndpoint(t, a.BrokerRecord, true), fixtureEndpoint(t, a.RelayRecord, false), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := policy.Members[0]
+	zero := 0
+	result := qualificationResult{Model: member.Policy.Model,
+		Text: member.ResponseText, Stop: "end_turn"}
+	result.Usage.Input, result.Usage.Output = &zero, &zero
+	if !cooperativeResultMatchesMember(&result, member) {
+		t.Fatal("signed member response was refused")
+	}
+	result.Text = "different local provider response"
+	if cooperativeResultMatchesMember(&result, member) {
+		t.Fatal("wrong H provider text accepted against A-signed qualification")
+	}
+}

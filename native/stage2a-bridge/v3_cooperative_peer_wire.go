@@ -13,6 +13,11 @@ type cooperativePeerAdmission struct {
 	Warrant     cooperativePeerWarrant
 }
 
+func cooperativeResultMatchesMember(out *qualificationResult, member v3Member) bool {
+	return out != nil && out.valid(member.Policy.Model) &&
+		out.Text == member.ResponseText
+}
+
 func (b *broker) serveCooperativePeer(ctx context.Context, conn *net.UnixConn,
 	a cooperativeBridgeAuthority, policy v3Authority, observation v3Observation,
 	ready cooperativeReadyState, relay endpoint, admitted cooperativePeerAdmission,
@@ -53,7 +58,7 @@ func (b *broker) serveCooperativePeer(ctx context.Context, conn *net.UnixConn,
 			admitted.MemberLease.Sequence, admitted.Warrant.SHA, model, promptSHA}
 		if b.call(ctx, "cooperative-ingress-"+admitted.Warrant.SHA,
 			"bridge.relay.ingress.cooperative.v3", request, out) != nil ||
-			out.Text != member.ResponseText {
+			!cooperativeResultMatchesMember(out, member) {
 			return invalid
 		}
 		return nil
