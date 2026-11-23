@@ -257,7 +257,7 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		PromptDigest string `json:"prompt_sha256"`
 	}{config.Model, requestDigest}
 	var result qualificationResult
-	if b.call(ctx, "qualify", qualifyOp, payload, &result) != nil || !result.valid(config.Model) ||
+	if b.call(ctx, "ingress", relayIngressOp, payload, &result) != nil || !result.valid(config.Model) ||
 		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid

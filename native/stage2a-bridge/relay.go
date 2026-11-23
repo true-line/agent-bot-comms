@@ -21,11 +21,11 @@ import (
 )
 
 const (
-	bindContext = "agent-bot-stage2a-bridge-bind-v2"
-	qualifyOp   = "bridge.qualification.messages.v1"
-	ioTimeout   = 5 * time.Second
+	bindContext    = "agent-bot-stage2a-bridge-bind-v2"
+	relayIngressOp = "bridge.relay.ingress.v1"
+	ioTimeout      = 5 * time.Second
 	// HQ may perform a lease check, authorize the turn, and recheck the lease.
-	qualificationTimeout = 20 * time.Second
+	relayIngressTimeout = 20 * time.Second
 )
 
 var (
@@ -215,8 +215,8 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 		return invalid
 	}
 	timeout := ioTimeout
-	if op == qualifyOp {
-		timeout = qualificationTimeout
+	if op == relayIngressOp {
+		timeout = relayIngressTimeout
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
