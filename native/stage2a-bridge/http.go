@@ -226,6 +226,22 @@ func (r qualificationResult) eventStream() []byte {
 }
 
 func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, attempted *bool) error {
+	return serveWithIngress(ctx, conn, config, relay, attempted, func(model, promptSHA string,
+		out *qualificationResult) error {
+		return b.call(ctx, "ingress", relayIngressOp,
+			struct {
+				Model        string `json:"model"`
+				PromptDigest string `json:"prompt_sha256"`
+			}{model, promptSHA}, out)
+	}, func() bool { return true })
+}
+
+func serveWithIngress(ctx context.Context, conn *net.UnixConn, config assignment,
+	relay endpoint, attempted *bool, authorize func(string, string, *qualificationResult) error,
+	currentPeer func() bool) error {
+	if authorize == nil || currentPeer == nil || !currentPeer() {
+		return invalid
+	}
 	if conn.SetReadDeadline(deadline()) != nil {
 		return nil
 	}
@@ -267,17 +283,13 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
 	}
-	if ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+	if ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
 		return invalid
 	}
 	*attempted = true
-	payload := struct {
-		Model        string `json:"model"`
-		PromptDigest string `json:"prompt_sha256"`
-	}{config.Model, requestDigest}
 	var result qualificationResult
-	if b.call(ctx, "ingress", relayIngressOp, payload, &result) != nil || !result.valid(config.Model) ||
-		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+	if authorize(config.Model, requestDigest, &result) != nil || !result.valid(config.Model) ||
+		ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid
 	}

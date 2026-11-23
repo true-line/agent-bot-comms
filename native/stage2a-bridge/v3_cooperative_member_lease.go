@@ -12,9 +12,14 @@ type cooperativeMemberLease struct {
 	Expires  time.Time
 }
 
+// H and the member exchange their own fresh challenge and may renew before B
+// sees a CLI socket. Several rotating CLI peers may use the same current
+// lease. B permits that exact digest, rejects lower or changed equal-sequence
+// leases, and relies on H's independent challenge continuity and A's fresh
+// per-peer warrant before any ingress can be attempted.
 func verifyCooperativeMemberLease(encoded string, policy v3Authority,
-	observation v3Observation, memberIndex int, readySHA, challenge string,
-	priorSequence int64, readyExpiry, now time.Time) (cooperativeMemberLease, error) {
+	observation v3Observation, memberIndex int, readySHA string,
+	priorSequence int64, priorSHA string, readyExpiry, now time.Time) (cooperativeMemberLease, error) {
 	if memberIndex < 0 || memberIndex >= len(policy.Members) ||
 		!validDigest(readySHA) || !now.Before(readyExpiry) ||
 		priorSequence < 0 || priorSequence >= 1<<53-1 {
@@ -41,8 +46,8 @@ func verifyCooperativeMemberLease(encoded string, policy v3Authority,
 		field(p, "member_launch_id") != policy.Members[memberIndex].Launch ||
 		field(p, "member_selector") != policy.Members[memberIndex].Selector ||
 		field(p, "grant_sha256") != observation.Children[memberIndex].GrantDigest ||
-		integer(p, "sequence") != priorSequence+1 ||
-		field(p, "challenge_nonce_base64url") != challenge {
+		integer(p, "sequence") <= 0 ||
+		integer(p, "sequence") >= 1<<53 {
 		return cooperativeMemberLease{}, invalid
 	}
 	nonce, err := unpadded(field(p, "challenge_nonce_base64url"), 32)
@@ -78,5 +83,9 @@ func verifyCooperativeMemberLease(encoded string, policy v3Authority,
 		expires.After(readyExpiry) || expires.After(observation.Expires) {
 		return cooperativeMemberLease{}, invalid
 	}
-	return cooperativeMemberLease{digest(raw), integer(p, "sequence"), expires}, nil
+	sha, sequence := digest(raw), integer(p, "sequence")
+	if sequence < priorSequence || (sequence == priorSequence && sha != priorSHA) {
+		return cooperativeMemberLease{}, invalid
+	}
+	return cooperativeMemberLease{sha, sequence, expires}, nil
 }

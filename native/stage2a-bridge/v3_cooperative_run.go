@@ -98,6 +98,8 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 	if err != nil {
 		return errors.New("cooperative aggregate Ready rejected")
 	}
+	var memberLeases [2]cooperativeMemberLease
+	var ingressAttempted bool
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -129,6 +131,18 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 			}
 			return errors.New("cooperative relay listener failed")
 		}
+		admitted, err := b.admitCooperativePeer(ctx, conn, authority, policy,
+			observation, ready, relay, memberLeases)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		memberLeases[admitted.MemberIndex] = admitted.MemberLease
+		err = b.serveCooperativePeer(ctx, conn, authority, policy, observation,
+			ready, relay, admitted, &ingressAttempted)
 		conn.Close()
+		if err != nil {
+			return errors.New("cooperative relay peer or ingress rejected")
+		}
 	}
 }

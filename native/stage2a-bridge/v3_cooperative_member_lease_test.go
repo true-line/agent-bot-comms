@@ -79,27 +79,26 @@ func TestCooperativeMemberLeaseBindsFreshChallengeAndObservedChild(t *testing.T)
 	encoded := base64.RawURLEncoding.EncodeToString(raw)
 	now := base.Add(2 * time.Second)
 	lease, err := verifyCooperativeMemberLease(encoded, policy, observation, 0, ready,
-		nonce, 0, base.Add(5*time.Second), now)
+		0, "", base.Add(5*time.Second), now)
 	if err != nil || lease.Sequence != 1 || lease.SHA != digest(raw) {
 		t.Fatalf("signed live member lease refused: %+v %v", lease, err)
 	}
 	if _, err := verifyCooperativeMemberLease(encoded, policy, observation, 0, ready,
-		nonce, 1, base.Add(5*time.Second), now); err == nil {
-		t.Fatal("replayed member lease accepted")
+		1, lease.SHA, base.Add(5*time.Second), now); err != nil {
+		t.Fatal("current lease cannot cover a second rotating CLI peer")
 	}
 	if _, err := verifyCooperativeMemberLease(encoded, policy, observation, 0, ready,
-		base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x62}, 32)), 0,
-		base.Add(5*time.Second), now); err == nil {
-		t.Fatal("wrong challenge accepted")
+		1, "sha256:"+strings.Repeat("0", 64), base.Add(5*time.Second), now); err == nil {
+		t.Fatal("changed equal-sequence member lease accepted")
 	}
 	changed := observation
 	changed.Children[0].PID++
 	if _, err := verifyCooperativeMemberLease(encoded, policy, changed, 0, ready,
-		nonce, 0, base.Add(5*time.Second), now); err == nil {
+		0, "", base.Add(5*time.Second), now); err == nil {
 		t.Fatal("changed observed ACP child accepted")
 	}
 	if _, err := verifyCooperativeMemberLease(encoded, policy, observation, 1, ready,
-		nonce, 0, base.Add(5*time.Second), now); err == nil {
+		0, "", base.Add(5*time.Second), now); err == nil {
 		t.Fatal("wrong member accepted")
 	}
 }
