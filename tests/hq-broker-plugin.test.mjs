@@ -15,7 +15,8 @@ import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
   BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2,
   BRIDGE_BIND_V3, BRIDGE_BIND_CHALLENGE_V3, BRIDGE_QUALIFICATION_MESSAGES,
-  BRIDGE_RELAY_INGRESS, STAGE2A_RELAY_PEER_CHALLENGE, brokerPlugin,
+  BRIDGE_RELAY_INGRESS, STAGE2A_RELAY_PEER_CHALLENGE,
+  BRIDGE_MEMBER_OBSERVE_V3, BRIDGE_MEMBER_ARM_V3, brokerPlugin,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
@@ -359,7 +360,7 @@ const V3_SCOPE = Object.freeze({ installation_id: 'install_1', start_id: `st_${'
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
 
 const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false,
-  relayIngressEnabled = false, peerEnabled = false) => definePlugin({
+  relayIngressEnabled = false, peerEnabled = false, armEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
@@ -368,6 +369,16 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
       bridgeRelayIngressEnabledV2: () => typeof relayIngressEnabled === 'function'
         ? relayIngressEnabled() : relayIngressEnabled,
       stage2aRelayPeerChallengeEnabled: () => peerEnabled,
+      stage2aMemberArmExchangeEnabledV3: () => armEnabled,
+      async stage2aMemberObserveV3(input, { connection }, receipt) {
+        log.push(['observe_v3', input, connection, receipt]);
+        return { kind: 'bridge.member.observe.v3.result', observe_nonce: input.observe_nonce };
+      },
+      async stage2aMemberArmV3(input, { connection }, receipt) {
+        log.push(['arm_v3', input, connection, receipt]);
+        return { kind: 'bridge.member.arm.v3.result', arm_nonce: input.arm_nonce,
+          state: 'recorded-pending-aggregate-ready' };
+      },
       async stage2aRelayPeerChallenge(input, { connection }, receipt) {
         log.push(['live_peer', input, connection, receipt]);
         return { verdict: 'verified' };
@@ -485,6 +496,62 @@ test('v3 bridge binds eight exact selectors then routes live peer on that bound 
     assert.deepEqual(log.at(-1), ['live_peer', frame, connection, receipt.bind_receipt]);
     await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
   } finally { await host.stop(); }
+});
+
+test('two-member observe and arm use only the same bound v3 broker stream', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, false, false, true),
+    brokerPlugin({ enableMemberArmExchange: true }),
+  ] });
+  await host.start();
+  try {
+    const observe = { kind: 'bridge.member.observe.v3.request', selectors: { ...V3_SCOPE },
+      member_id: 'm_lead', member_selector: `mb_${'2'.repeat(64)}`,
+      observe_nonce: '3'.repeat(64) };
+    const arm = { ...observe, kind: 'bridge.member.arm.v3.request', arm_nonce: '4'.repeat(64),
+      child_observation_envelope_sha256: `sha256:${'5'.repeat(64)}`,
+      bridge_arm: { member_id: 'm_lead' },
+      bridge_arm_receipt_sha256: `sha256:${'6'.repeat(64)}` };
+    const connection = 'b_v3_arm';
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3, observe,
+      { connection }), code('caller_mismatch'));
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3,
+      { ...observe, selectors: { ...observe.selectors, start_id: `st_${'0'.repeat(24)}` } },
+      { connection }), code('host.invalid_request'));
+    assert.deepEqual(await host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3, observe, { connection }),
+      { kind: 'bridge.member.observe.v3.result', observe_nonce: observe.observe_nonce });
+    assert.deepEqual(await host.brokerAccept(BRIDGE_MEMBER_ARM_V3, arm, { connection }),
+      { kind: 'bridge.member.arm.v3.result', arm_nonce: arm.arm_nonce,
+        state: 'recorded-pending-aggregate-ready' });
+    assert.deepEqual(log.slice(-2).map(([kind, , conn]) => [kind, conn]),
+      [['observe_v3', connection], ['arm_v3', connection]]);
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_ARM_V3, arm,
+      { connection: 'other' }), code('caller_mismatch'));
+  } finally { await host.stop(); }
+});
+
+test('two-member arm remains closed when either optional gate is absent', async () => {
+  for (const [enabled, hqEnabled] of [[false, true], [true, false]]) {
+    const log = [];
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, false, false, false, hqEnabled),
+      brokerPlugin({ enableMemberArmExchange: enabled }),
+    ] });
+    await host.start();
+    try {
+      const connection = 'b_v3_closed';
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+      await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+      await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3,
+        { kind: 'bridge.member.observe.v3.request', selectors: V3_SCOPE,
+          member_id: 'm_lead', member_selector: `mb_${'2'.repeat(64)}`,
+          observe_nonce: '3'.repeat(64) }, { connection }), code('caller_mismatch'));
+      assert.equal(log.some(([kind]) => kind === 'observe_v3'), false);
+    } finally { await host.stop(); }
+  }
 });
 
 test('protected bridge bind uses the launch reservation on the same connection', async () => {
