@@ -24,13 +24,15 @@ static int read_peer_audit_token(int fd, uid_t *uid, pid_t *pid, int *pid_versio
 }
 
 static int read_process_start(pid_t pid, pid_t *observed_pid, pid_t *parent_pid,
-                              uint64_t *start_seconds, uint64_t *start_micros) {
+                              uid_t *observed_uid, uint64_t *start_seconds,
+                              uint64_t *start_micros) {
 	struct proc_bsdinfo info;
 	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
 		return -1;
 	}
 	*observed_pid = info.pbi_pid;
 	*parent_pid = info.pbi_ppid;
+	*observed_uid = info.pbi_uid;
 	*start_seconds = info.pbi_start_tvsec;
 	*start_micros = info.pbi_start_tvusec;
 	return 0;
@@ -53,13 +55,15 @@ type peerProcessIdentity struct {
 }
 
 // peerProcessSnapshot is a live kernel view of the socket peer and its direct
-// parent. A later authority check must compare it with Machine's signed ACP
-// parent and live-peer attestation, then obtain a fresh snapshot before use.
+// parent. The socket audit token identifies its original peer, while the
+// process table describes a PID that may be reused. Authorization must match
+// the fresh start times to Machine's signed observation and refuse exit/reuse.
 type peerProcessSnapshot struct {
 	Peer               peerProcessIdentity
 	StartSeconds       uint64
 	StartMicros        uint64
 	ParentPID          int
+	ParentUID          uint32
 	ParentStartSeconds uint64
 	ParentStartMicros  uint64
 }
@@ -91,15 +95,20 @@ func observePeerProcess(conn *net.UnixConn) (peerProcessSnapshot, error) {
 		return peerProcessSnapshot{}, err
 	}
 	var observedPID, parentPID C.pid_t
+	var observedUID C.uid_t
 	var startSeconds, startMicros C.uint64_t
-	if C.read_process_start(C.pid_t(peer.PID), &observedPID, &parentPID, &startSeconds, &startMicros) != 0 ||
-		int(observedPID) != peer.PID || parentPID <= 1 || startSeconds == 0 || startMicros >= 1000000 {
+	if C.read_process_start(C.pid_t(peer.PID), &observedPID, &parentPID,
+		&observedUID, &startSeconds, &startMicros) != 0 ||
+		int(observedPID) != peer.PID || uint32(observedUID) != peer.UID ||
+		parentPID <= 1 || startSeconds == 0 || startMicros >= 1000000 {
 		return peerProcessSnapshot{}, errors.New("kernel peer process unavailable")
 	}
 	var observedParentPID, grandparentPID C.pid_t
+	var observedParentUID C.uid_t
 	var parentStartSeconds, parentStartMicros C.uint64_t
 	if C.read_process_start(parentPID, &observedParentPID, &grandparentPID,
-		&parentStartSeconds, &parentStartMicros) != 0 || observedParentPID != parentPID ||
+		&observedParentUID, &parentStartSeconds, &parentStartMicros) != 0 ||
+		observedParentPID != parentPID || uint32(observedParentUID) != peer.UID ||
 		parentStartSeconds == 0 || parentStartMicros >= 1000000 {
 		return peerProcessSnapshot{}, errors.New("kernel peer parent unavailable")
 	}
@@ -108,7 +117,8 @@ func observePeerProcess(conn *net.UnixConn) (peerProcessSnapshot, error) {
 	}
 	return peerProcessSnapshot{
 		Peer: peer, StartSeconds: uint64(startSeconds), StartMicros: uint64(startMicros),
-		ParentPID: int(parentPID), ParentStartSeconds: uint64(parentStartSeconds),
-		ParentStartMicros: uint64(parentStartMicros),
+		ParentPID: int(parentPID), ParentUID: uint32(observedParentUID),
+		ParentStartSeconds: uint64(parentStartSeconds),
+		ParentStartMicros:  uint64(parentStartMicros),
 	}, nil
 }

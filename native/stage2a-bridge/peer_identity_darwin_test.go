@@ -68,7 +68,12 @@ func TestPeerAuditTokenDistinguishesSameUIDProcesses(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
 	childServer, err := listener.AcceptUnix()
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +92,17 @@ func TestPeerAuditTokenDistinguishesSameUIDProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot.Peer != childIdentity || snapshot.ParentPID != os.Getpid() ||
+		snapshot.ParentUID != uint32(os.Geteuid()) ||
 		snapshot.StartSeconds == 0 || snapshot.ParentStartSeconds == 0 {
 		t.Fatalf("child process snapshot = %+v, want parent PID %d", snapshot, os.Getpid())
+	}
+	if _, err := childServer.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observePeerProcess(childServer); err == nil {
+		t.Fatal("exited socket peer accepted from stale audit token")
 	}
 }

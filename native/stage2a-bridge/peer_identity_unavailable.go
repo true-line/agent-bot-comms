@@ -18,6 +18,7 @@ type peerProcessSnapshot struct {
 	StartSeconds       uint64
 	StartMicros        uint64
 	ParentPID          int
+	ParentUID          uint32
 	ParentStartSeconds uint64
 	ParentStartMicros  uint64
 }
