@@ -58,8 +58,17 @@ func runV3(ctx context.Context, authority v3Authority, key []byte,
 		if _, _, err := b.armV3Member(ctx, authority, i); err != nil {
 			return errors.New("two-member bridge arm rejected")
 		}
+		if !relay.current() || !f.Broker.current() || !time.Now().Before(f.Expires) {
+			return errors.New("v3 bridge authority or endpoint expired")
+		}
 	}
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !relay.current() || !f.Broker.current() || !time.Now().Before(f.Expires) {
+			return errors.New("v3 bridge authority or endpoint expired")
+		}
 		if listener.SetDeadline(time.Now().Add(250*time.Millisecond)) != nil {
 			return errors.New("relay listener deadline unavailable")
 		}
@@ -69,9 +78,6 @@ func runV3(ctx context.Context, authority v3Authority, key []byte,
 				return nil
 			}
 			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-				if !relay.current() || !f.Broker.current() || !time.Now().Before(f.Expires) {
-					return errors.New("v3 bridge authority or endpoint expired")
-				}
 				continue
 			}
 			return errors.New("relay listener failed")
