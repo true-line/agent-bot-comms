@@ -1,10 +1,71 @@
 package main
 
 import (
+	"context"
 	"time"
 )
 
 const cooperativeReadyPurpose = "agent-bot/soul-cooperative-member-ready/v3"
+
+type cooperativeReadyReply struct {
+	ReadyEnvelope          string `json:"ready_envelope_base64url"`
+	ReadySHA               string `json:"ready_sha256"`
+	BridgeObservedEnvelope string `json:"bridge_observed_envelope_base64url"`
+	BridgeObservedSHA      string `json:"bridge_observed_sha256"`
+	LeaseEnvelope          string `json:"lease_envelope_base64url"`
+	LeaseSHA               string `json:"lease_sha256"`
+	LeaseSequence          uint64 `json:"lease_sequence"`
+}
+
+// The first Ready call travels on the same HMAC-bound B→H connection used
+// for policy and both arm rows. Its B lease remains unusable until a separate
+// signature and short-expiry verifier accepts it.
+func (b *broker) cooperativeReady(ctx context.Context, a cooperativeBridgeAuthority,
+	policy v3Authority, observation v3Observation, armDigests [2]string,
+	bindReceipt string, relay endpoint) (string, time.Time, error) {
+	var empty time.Time
+	if !cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
+		!cooperativeEndpointCurrent(a.RelayRecord, relay) {
+		return "", empty, invalid
+	}
+	nonce, err := randomBase64Nonce()
+	if err != nil {
+		return "", empty, invalid
+	}
+	request := struct {
+		ChildObservationSHA string `json:"child_observation_envelope_sha256"`
+		MemberAuthoritySHA  string `json:"member_b_authority_envelope_sha256"`
+		Nonce               string `json:"challenge_nonce_base64url"`
+	}{observation.EnvelopeDigest, policy.FD3.Selectors.AuthorityDigest, nonce}
+	var result cooperativeReadyReply
+	if b.call(ctx, "cooperative-ready", "bridge.ready.cooperative.v3", request, &result) != nil ||
+		!validDigest(result.ReadySHA) || !validDigest(result.BridgeObservedSHA) ||
+		!validDigest(result.LeaseSHA) || result.LeaseSequence != 1 ||
+		result.LeaseEnvelope == "" ||
+		!cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
+		!cooperativeEndpointCurrent(a.RelayRecord, relay) {
+		return "", empty, invalid
+	}
+	birth, err := cooperativeBirthtimeNS(relay.Path)
+	if err != nil {
+		return "", empty, invalid
+	}
+	observedSHA, observedExpiry, err := verifyCooperativeBObserved(
+		result.BridgeObservedEnvelope, a, policy.Pin[:], bindReceipt,
+		relay, birth, time.Now(), cooperativeSelfMatches)
+	if err != nil || observedSHA != result.BridgeObservedSHA {
+		return "", empty, invalid
+	}
+	readySHA, readyExpiry, err := verifyCooperativeReady(result.ReadyEnvelope,
+		policy, observation, armDigests, observedSHA, time.Now())
+	if err != nil || readySHA != result.ReadySHA {
+		return "", empty, invalid
+	}
+	if observedExpiry.Before(readyExpiry) {
+		readyExpiry = observedExpiry
+	}
+	return readySHA, readyExpiry, nil
+}
 
 // The A signature joins B's two exact provisional arm rows to the observed
 // ACP children. It is not a lease or a per-CLI-peer authorization.

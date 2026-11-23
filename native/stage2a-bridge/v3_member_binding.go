@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,14 @@ func randomNonce() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes[:]), nil
+}
+
+func randomBase64Nonce() (string, error) {
+	var bytes [32]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes[:]), nil
 }
 
 func jcsInteger(value int64) json.Number {
@@ -97,7 +106,7 @@ func retryV3Observe(ctx context.Context, call func(int, *v3ObserveReply) error,
 func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 	index int) (map[string]any, string, error) {
 	return b.armMemberWithWire(ctx, authority, index, "bridge.member.observe.v3",
-		"bridge.member.arm.v3", verifyV3Observation)
+		"bridge.member.arm.v3", verifyV3Observation, nil)
 }
 
 // Cooperative B uses distinct operations and payload kinds on the same
@@ -106,12 +115,22 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 func (b *broker) armCooperativeMember(ctx context.Context, authority v3Authority,
 	index int) (map[string]any, string, error) {
 	return b.armMemberWithWire(ctx, authority, index, "bridge.member.observe.cooperative.v3",
-		"bridge.member.arm.cooperative.v3", verifyCooperativeObservation)
+		"bridge.member.arm.cooperative.v3", verifyCooperativeObservation, nil)
+}
+
+func (b *broker) armCooperativeMemberObserved(ctx context.Context, authority v3Authority,
+	index int, observed *v3Observation) (map[string]any, string, error) {
+	if observed == nil {
+		return nil, "", invalid
+	}
+	return b.armMemberWithWire(ctx, authority, index, "bridge.member.observe.cooperative.v3",
+		"bridge.member.arm.cooperative.v3", verifyCooperativeObservation, observed)
 }
 
 func (b *broker) armMemberWithWire(ctx context.Context, authority v3Authority, index int,
 	observeOp, armOp string,
-	verifyObservation func(string, v3Authority, time.Time) (v3Observation, error)) (map[string]any, string, error) {
+	verifyObservation func(string, v3Authority, time.Time) (v3Observation, error),
+	observed *v3Observation) (map[string]any, string, error) {
 	if index < 0 || index >= len(authority.Members) {
 		return nil, "", invalid
 	}
@@ -187,6 +206,9 @@ func (b *broker) armMemberWithWire(ctx context.Context, authority v3Authority, i
 		!time.Now().Before(reply.Expires) || !time.Now().Before(authority.FD3.Expires) ||
 		!liveV3Child(observation.Children[index], member) {
 		return nil, "", invalid
+	}
+	if observed != nil {
+		*observed = observation
 	}
 	return arm, armDigest, nil
 }

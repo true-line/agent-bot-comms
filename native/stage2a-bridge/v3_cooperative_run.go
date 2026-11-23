@@ -75,15 +75,28 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 	// H holds each observe call until A has signed the two-child observation.
 	// Both arm acknowledgments are provisional; no relay connection is served
 	// without a later, independently verified aggregate Ready and live peer.
+	var observation v3Observation
+	var armDigests [2]string
 	for i := range policy.Members {
-		if _, _, err := b.armCooperativeMember(ctx, policy, i); err != nil {
+		var observed v3Observation
+		_, armDigest, err := b.armCooperativeMemberObserved(ctx, policy, i, &observed)
+		if err != nil || (i != 0 && observed.EnvelopeDigest != observation.EnvelopeDigest) {
 			return errors.New("cooperative two-member bridge arm rejected")
 		}
+		if i == 0 {
+			observation = observed
+		}
+		armDigests[i] = armDigest
 		if !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
 			!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
 			!time.Now().Before(policy.FD3.Expires) {
 			return errors.New("cooperative authority or endpoint expired")
 		}
+	}
+	_, readyExpiry, err := b.cooperativeReady(ctx, authority, policy, observation,
+		armDigests, receipt, relay)
+	if err != nil {
+		return errors.New("cooperative aggregate Ready rejected")
 	}
 	for {
 		if ctx.Err() != nil {
@@ -91,7 +104,7 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 		}
 		if !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
 			!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
-			!time.Now().Before(policy.FD3.Expires) {
+			!time.Now().Before(readyExpiry) {
 			return errors.New("cooperative authority or endpoint expired")
 		}
 		if listener.SetDeadline(time.Now().Add(250*time.Millisecond)) != nil {

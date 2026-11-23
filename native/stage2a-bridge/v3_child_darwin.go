@@ -17,6 +17,8 @@ static int stage2a_child_snapshot(pid_t pid, struct proc_bsdinfo *info,
 */
 import "C"
 
+import "os"
+
 func childProcessSnapshot(pid int64) (C.struct_proc_bsdinfo, string, bool) {
 	var info C.struct_proc_bsdinfo
 	var path [4096]C.char
@@ -67,4 +69,30 @@ func liveV3Child(child v3ObservedChild, member v3Member) bool {
 	}
 	againLauncher, _, ok := childProcessSnapshot(child.LauncherPID)
 	return ok && sameProcessStart(launcher, againLauncher)
+}
+
+func cooperativeSelfMatches(bridge, launcher map[string]any) bool {
+	self, _, ok := childProcessSnapshot(int64(os.Getpid()))
+	if !ok || int64(self.pbi_pid) != integer(bridge, "pid") ||
+		uint32(self.pbi_uid) != uint32(integer(bridge, "uid")) ||
+		uint32(self.pbi_gid) != uint32(integer(bridge, "gid")) ||
+		int64(self.pbi_start_tvsec) != integer(bridge, "start_seconds") ||
+		int64(self.pbi_start_tvusec) != integer(bridge, "start_micros") ||
+		int64(self.pbi_ppid) != integer(launcher, "pid") {
+		return false
+	}
+	parent, _, ok := childProcessSnapshot(int64(self.pbi_ppid))
+	if !ok || int64(parent.pbi_pid) != integer(launcher, "pid") ||
+		uint32(parent.pbi_uid) != uint32(integer(launcher, "uid")) ||
+		uint32(parent.pbi_gid) != uint32(integer(launcher, "gid")) ||
+		int64(parent.pbi_start_tvsec) != integer(launcher, "start_seconds") ||
+		int64(parent.pbi_start_tvusec) != integer(launcher, "start_micros") {
+		return false
+	}
+	again, _, ok := childProcessSnapshot(int64(self.pbi_pid))
+	if !ok || !sameProcessStart(self, again) {
+		return false
+	}
+	againParent, _, ok := childProcessSnapshot(int64(parent.pbi_pid))
+	return ok && sameProcessStart(parent, againParent)
 }
