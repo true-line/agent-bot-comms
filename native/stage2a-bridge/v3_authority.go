@@ -51,18 +51,21 @@ type v3FD3 struct {
 }
 
 type v3Member struct {
-	ID           string
-	Launch       string
-	Selector     string
-	CLIPath      string
-	CLIDigest    string
-	Policy       assignment
-	ResponseText string
+	ID            string
+	Launch        string
+	Selector      string
+	CLIPath       string
+	CLIDigest     string
+	CommandDigest string
+	Policy        assignment
+	ResponseText  string
 }
 
 type v3Authority struct {
-	FD3     v3FD3
-	Members [2]v3Member
+	FD3        v3FD3
+	Members    [2]v3Member
+	Assignment map[string]any
+	Pin        [32]byte
 }
 
 func object(value any) (map[string]any, bool)    { m, ok := value.(map[string]any); return m, ok }
@@ -205,6 +208,8 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 	if err != nil || digest(ab) != s.AssignmentDigest {
 		return v3Authority{}, invalid
 	}
+	copy(result.Pin[:], pin)
+	result.Assignment = a
 	b, bb, err := signedV3Payload(f.AuthorityEnvelope, pin, v3AuthorityPurpose)
 	if err != nil || digest(bb) != s.AuthorityDigest {
 		return v3Authority{}, invalid
@@ -295,7 +300,7 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 		}
 		id, launch, selector := field(am, "member_id"), field(am, "launch_id"), field(am, "member_selector")
 		if !idPattern.MatchString(id) || !launchPattern.MatchString(launch) || !selectorPattern.MatchString(selector) ||
-			field(am, "role") == "" || !idPattern.MatchString(field(am, "adapter_id")) ||
+			(field(am, "role") != "lead" && field(am, "role") != "specialist") || !idPattern.MatchString(field(am, "adapter_id")) ||
 			field(am, "adapter_version") == "" || !validDigest(field(am, "command_sha256")) ||
 			!validDigest(field(am, "adjacent_cli_sha256")) ||
 			!filepath.IsAbs(field(am, "command_path")) || !filepath.IsAbs(field(am, "adjacent_cli_path")) ||
@@ -327,7 +332,8 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 		}
 		result.Members[i] = v3Member{ID: id, Launch: launch, Selector: selector,
 			CLIPath: field(am, "adjacent_cli_path"), CLIDigest: field(am, "adjacent_cli_sha256"),
-			ResponseText: responseText,
+			CommandDigest: field(am, "command_sha256"),
+			ResponseText:  responseText,
 			Policy: assignment{Model: field(q, "model"), RequestDigest: field(q, "request_sha256"),
 				HeadersDigest: field(q, "headers_sha256"), ClientKeyDigest: field(q, "client_key_sha256"),
 				HTTPHost: field(q, "http_host"), MessagesQuery: field(q, "messages_query")}}
