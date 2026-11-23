@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -212,5 +213,33 @@ func TestCooperativeBindFixedPreimage(t *testing.T) {
 	}
 	if _, err := cooperativeProof(key[:31], strings.Repeat("a", 64), a); err == nil {
 		t.Fatal("truncated FD4 key accepted")
+	}
+}
+
+func TestCooperativeSignedChildObservation(t *testing.T) {
+	a, result, pin, now := policyFixture(t)
+	broker := fixtureEndpoint(t, a.BrokerRecord, true)
+	relay := fixtureEndpoint(t, a.RelayRecord, false)
+	authority, err := verifyCooperativePolicy(result, a, pin, broker, relay, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("testdata/v3-cooperative-observation.jcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = bytes.TrimSpace(raw)
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	observed, err := verifyCooperativeObservation(encoded, authority, now.Add(time.Second))
+	if err != nil || observed.EnvelopeDigest != digest(raw) ||
+		observed.Children[0].MemberID != authority.Members[0].ID ||
+		observed.Children[1].MemberID != authority.Members[1].ID {
+		t.Fatalf("A-signed cooperative two-child observation refused: %v", err)
+	}
+	if _, err := verifyV3Observation(encoded, authority, now.Add(time.Second)); err == nil {
+		t.Fatal("cooperative observation crossed protected profile")
+	}
+	if _, err := verifyCooperativeObservation(encoded, authority, observed.Expires); err == nil {
+		t.Fatal("expired cooperative child observation accepted")
 	}
 }

@@ -168,7 +168,7 @@ func decodeBrokerResult(data []byte, id, op string, out any) error {
 		return invalid
 	}
 	if !reply.OK {
-		if op == "bridge.member.observe.v3" && reply.HostRefusal != nil &&
+		if (op == "bridge.member.observe.v3" || op == "bridge.member.observe.cooperative.v3") && reply.HostRefusal != nil &&
 			reply.HostRefusal.Code == "host.launch_busy" &&
 			reply.HostRefusal.Explanation != "" &&
 			reply.HostRefusal.CorrelationID != "" &&

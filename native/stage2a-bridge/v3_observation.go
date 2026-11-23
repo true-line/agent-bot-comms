@@ -38,6 +38,18 @@ type v3Observation struct {
 // This is a signature and immutable-join check. The caller must separately
 // compare each child with a fresh kernel process snapshot before arming.
 func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (v3Observation, error) {
+	return verifyMemberObservation(encoded, authority, now, "managed-protected")
+}
+
+func verifyCooperativeObservation(encoded string, authority v3Authority, now time.Time) (v3Observation, error) {
+	if field(authority.Assignment, "profile_in_force") != "managed-cooperative" {
+		return v3Observation{}, invalid
+	}
+	return verifyMemberObservation(encoded, authority, now, "managed-cooperative")
+}
+
+func verifyMemberObservation(encoded string, authority v3Authority, now time.Time,
+	profile string) (v3Observation, error) {
 	var result v3Observation
 	f := authority.FD3
 	a := authority.Assignment
@@ -52,7 +64,7 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 		field(o, "contract") != "machine/v3" ||
 		field(o, "kind") != "stage2a-member-set-child-observation" ||
 		integer(o, "schema_version") != 1 ||
-		field(o, "profile_in_force") != "managed-protected" {
+		field(o, "profile_in_force") != profile {
 		return v3Observation{}, invalid
 	}
 	for _, key := range []string{"profile_in_force", "host_id", "installation_id",

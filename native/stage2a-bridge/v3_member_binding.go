@@ -96,6 +96,22 @@ func retryV3Observe(ctx context.Context, call func(int, *v3ObserveReply) error,
 // pending only; it does not open relay ingress or claim aggregate Ready.
 func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 	index int) (map[string]any, string, error) {
+	return b.armMemberWithWire(ctx, authority, index, "bridge.member.observe.v3",
+		"bridge.member.arm.v3", verifyV3Observation)
+}
+
+// Cooperative B uses distinct operations and payload kinds on the same
+// HMAC-bound broker connection. Its A observation has the cooperative profile.
+// The returned arm row is provisional until a later A-signed aggregate Ready.
+func (b *broker) armCooperativeMember(ctx context.Context, authority v3Authority,
+	index int) (map[string]any, string, error) {
+	return b.armMemberWithWire(ctx, authority, index, "bridge.member.observe.cooperative.v3",
+		"bridge.member.arm.cooperative.v3", verifyCooperativeObservation)
+}
+
+func (b *broker) armMemberWithWire(ctx context.Context, authority v3Authority, index int,
+	observeOp, armOp string,
+	verifyObservation func(string, v3Authority, time.Time) (v3Observation, error)) (map[string]any, string, error) {
 	if index < 0 || index >= len(authority.Members) {
 		return nil, "", invalid
 	}
@@ -116,18 +132,18 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 		MemberID       string      `json:"member_id"`
 		MemberSelector string      `json:"member_selector"`
 		Nonce          string      `json:"observe_nonce"`
-	}{"bridge.member.observe.v3.request", authority.FD3.Selectors, member.ID, member.Selector, observeNonce}
+	}{observeOp + ".request", authority.FD3.Selectors, member.ID, member.Selector, observeNonce}
 	observedReply, err := retryV3Observe(ctx, func(attempt int, out *v3ObserveReply) error {
 		return b.call(ctx, "observe-"+strconv.Itoa(index)+"-"+strconv.Itoa(attempt),
-			"bridge.member.observe.v3", observeRequest, out)
+			observeOp, observeRequest, out)
 	}, func() bool { return !b.waiting.Load() })
-	if err != nil || observedReply.Kind != "bridge.member.observe.v3.result" ||
+	if err != nil || observedReply.Kind != observeOp+".result" ||
 		observedReply.MemberID != member.ID || observedReply.MemberSelector != member.Selector ||
 		observedReply.Nonce != observeNonce || !validDigest(observedReply.Digest) ||
 		!time.Now().Before(observedReply.Expires) {
 		return nil, "", invalid
 	}
-	observation, err := verifyV3Observation(observedReply.Envelope, authority, time.Now())
+	observation, err := verifyObservation(observedReply.Envelope, authority, time.Now())
 	if err != nil || observation.EnvelopeDigest != observedReply.Digest ||
 		observedReply.Expires.After(observation.Expires) ||
 		!liveV3Child(observation.Children[index], member) {
@@ -152,7 +168,7 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 		ObservationHash string         `json:"child_observation_envelope_sha256"`
 		Arm             map[string]any `json:"bridge_arm"`
 		ArmDigest       string         `json:"bridge_arm_receipt_sha256"`
-	}{"bridge.member.arm.v3.request", authority.FD3.Selectors, member.ID, member.Selector,
+	}{armOp + ".request", authority.FD3.Selectors, member.ID, member.Selector,
 		observeNonce, armNonce, observation.EnvelopeDigest, arm, armDigest}
 	var reply struct {
 		Kind           string    `json:"kind"`
@@ -163,8 +179,8 @@ func (b *broker) armV3Member(ctx context.Context, authority v3Authority,
 		State          string    `json:"state"`
 		Expires        time.Time `json:"expires_at"`
 	}
-	if b.call(ctx, "arm-"+strconv.Itoa(index), "bridge.member.arm.v3", armRequest, &reply) != nil ||
-		reply.Kind != "bridge.member.arm.v3.result" ||
+	if b.call(ctx, "arm-"+strconv.Itoa(index), armOp, armRequest, &reply) != nil ||
+		reply.Kind != armOp+".result" ||
 		reply.MemberID != member.ID || reply.MemberSelector != member.Selector ||
 		reply.Nonce != armNonce || reply.Digest != armDigest ||
 		reply.State != "recorded-pending-aggregate-ready" ||
