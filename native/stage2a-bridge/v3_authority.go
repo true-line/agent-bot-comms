@@ -56,6 +56,7 @@ type v3Member struct {
 	Selector      string
 	CLIPath       string
 	CLIDigest     string
+	CommandPath   string
 	CommandDigest string
 	Policy        assignment
 	ResponseText  string
@@ -332,6 +333,7 @@ func verifyV3FD3(raw, pin []byte, now time.Time) (v3Authority, error) {
 		}
 		result.Members[i] = v3Member{ID: id, Launch: launch, Selector: selector,
 			CLIPath: field(am, "adjacent_cli_path"), CLIDigest: field(am, "adjacent_cli_sha256"),
+			CommandPath:   field(am, "command_path"),
 			CommandDigest: field(am, "command_sha256"),
 			ResponseText:  responseText,
 			Policy: assignment{Model: field(q, "model"), RequestDigest: field(q, "request_sha256"),

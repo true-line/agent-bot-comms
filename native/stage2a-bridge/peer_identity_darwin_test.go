@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -96,6 +98,29 @@ func TestPeerAuditTokenDistinguishesSameUIDProcesses(t *testing.T) {
 		snapshot.StartSeconds == 0 || snapshot.ParentStartSeconds == 0 {
 		t.Fatalf("child process snapshot = %+v, want parent PID %d", snapshot, os.Getpid())
 	}
+	observedChild := v3ObservedChild{
+		PID: int64(childIdentity.PID), UID: childIdentity.UID, GID: uint32(os.Getgid()),
+		ParentPID: int64(snapshot.ParentPID), ProcessGroup: int64(syscall.Getpgrp()),
+		StartSeconds: int64(snapshot.StartSeconds), StartMicros: int64(snapshot.StartMicros),
+		LauncherPID: int64(os.Getpid()), LauncherUID: uint32(os.Geteuid()),
+		LauncherGID:          uint32(os.Getgid()),
+		LauncherStartSeconds: int64(snapshot.ParentStartSeconds),
+		LauncherStartMicros:  int64(snapshot.ParentStartMicros),
+		CommandDigest:        "sha256:" + strings.Repeat("a", 64),
+	}
+	_, observedPath, ok := childProcessSnapshot(observedChild.PID)
+	if !ok {
+		t.Fatal("live child path unavailable")
+	}
+	member := v3Member{CommandPath: observedPath, CommandDigest: observedChild.CommandDigest}
+	if !liveV3Child(observedChild, member) {
+		t.Fatal("live observed child/launcher pair refused")
+	}
+	wrongStart := observedChild
+	wrongStart.LauncherStartMicros++
+	if liveV3Child(wrongStart, member) {
+		t.Fatal("changed launcher start accepted")
+	}
 	if _, err := childServer.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
@@ -104,5 +129,8 @@ func TestPeerAuditTokenDistinguishesSameUIDProcesses(t *testing.T) {
 	}
 	if _, err := observePeerProcess(childServer); err == nil {
 		t.Fatal("exited socket peer accepted from stale audit token")
+	}
+	if liveV3Child(observedChild, member) {
+		t.Fatal("exited child accepted from signed observation")
 	}
 }

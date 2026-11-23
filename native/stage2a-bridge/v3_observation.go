@@ -7,18 +7,24 @@ import (
 const v3ObservationPurpose = "agent-bot/stage2a-member-set-child-observation/v1"
 
 type v3ObservedChild struct {
-	MemberID      string
-	Selector      string
-	Launch        string
-	RuntimeID     string
-	PID           int64
-	UID           uint32
-	GID           uint32
-	ParentPID     int64
-	ProcessGroup  int64
-	StartSeconds  int64
-	StartMicros   int64
-	CommandDigest string
+	MemberID             string
+	Selector             string
+	Launch               string
+	RuntimeID            string
+	GrantDigest          string
+	LauncherPID          int64
+	LauncherUID          uint32
+	LauncherGID          uint32
+	LauncherStartSeconds int64
+	LauncherStartMicros  int64
+	PID                  int64
+	UID                  uint32
+	GID                  uint32
+	ParentPID            int64
+	ProcessGroup         int64
+	StartSeconds         int64
+	StartMicros          int64
+	CommandDigest        string
 }
 
 type v3Observation struct {
@@ -104,7 +110,8 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 		child, childOK := object(children[i])
 		mapMember, memberOK := object(mapped[i])
 		if !childOK || !memberOK ||
-			!exactKeys(child, "member_id", "launch_id", "member_selector", "runtime_id", "child_process") ||
+			!exactKeys(child, "member_id", "launch_id", "member_selector", "runtime_id",
+				"grant_sha256", "launcher_process", "child_process") ||
 			!exactKeys(mapMember, "member_id", "member_selector", "runtime_id", "channel_binding") ||
 			field(child, "member_id") != authority.Members[i].ID ||
 			field(child, "launch_id") != authority.Members[i].Launch ||
@@ -113,7 +120,18 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 			field(mapMember, "member_selector") != authority.Members[i].Selector ||
 			field(mapMember, "runtime_id") != field(child, "runtime_id") ||
 			!idPattern.MatchString(field(child, "runtime_id")) ||
+			!validDigest(field(child, "grant_sha256")) ||
 			field(mapMember, "channel_binding") == "" {
+			return v3Observation{}, invalid
+		}
+		launcher, ok := object(child["launcher_process"])
+		if !ok || !exactKeys(launcher, "pid", "uid", "gid", "start_seconds", "start_micros") ||
+			integer(launcher, "pid") < 2 ||
+			integer(launcher, "uid") < 300 || integer(launcher, "uid") > 399 ||
+			integer(launcher, "gid") < 1 ||
+			integer(launcher, "start_seconds") < 1 ||
+			integer(launcher, "start_micros") < 0 ||
+			integer(launcher, "start_micros") >= 1000000 {
 			return v3Observation{}, invalid
 		}
 		process, ok := object(child["child_process"])
@@ -121,7 +139,10 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 			"process_group_id", "start_seconds", "start_micros", "executable_sha256") ||
 			integer(process, "pid") < 2 ||
 			integer(process, "uid") < 300 || integer(process, "uid") > 399 ||
-			integer(process, "gid") < 1 || integer(process, "parent_pid") < 2 ||
+			integer(process, "gid") < 1 ||
+			integer(process, "parent_pid") != integer(launcher, "pid") ||
+			integer(process, "uid") != integer(launcher, "uid") ||
+			integer(process, "gid") != integer(launcher, "gid") ||
 			integer(process, "process_group_id") < 2 ||
 			integer(process, "start_seconds") < 1 ||
 			integer(process, "start_micros") < 0 ||
@@ -130,6 +151,7 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 			return v3Observation{}, invalid
 		}
 		if i == 1 && (integer(process, "pid") == result.Children[0].PID ||
+			integer(launcher, "pid") == result.Children[0].LauncherPID ||
 			field(child, "runtime_id") == result.Children[0].RuntimeID ||
 			field(mapMember, "channel_binding") == firstBinding) {
 			return v3Observation{}, invalid
@@ -140,7 +162,13 @@ func verifyV3Observation(encoded string, authority v3Authority, now time.Time) (
 		result.Children[i] = v3ObservedChild{
 			MemberID: authority.Members[i].ID, Selector: authority.Members[i].Selector,
 			Launch: authority.Members[i].Launch, RuntimeID: field(child, "runtime_id"),
-			PID: integer(process, "pid"), UID: uint32(integer(process, "uid")),
+			GrantDigest:          field(child, "grant_sha256"),
+			LauncherPID:          integer(launcher, "pid"),
+			LauncherUID:          uint32(integer(launcher, "uid")),
+			LauncherGID:          uint32(integer(launcher, "gid")),
+			LauncherStartSeconds: integer(launcher, "start_seconds"),
+			LauncherStartMicros:  integer(launcher, "start_micros"),
+			PID:                  integer(process, "pid"), UID: uint32(integer(process, "uid")),
 			GID: uint32(integer(process, "gid")), ParentPID: integer(process, "parent_pid"),
 			ProcessGroup:  integer(process, "process_group_id"),
 			StartSeconds:  integer(process, "start_seconds"),
