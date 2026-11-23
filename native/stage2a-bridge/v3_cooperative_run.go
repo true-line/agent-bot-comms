@@ -49,7 +49,8 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 	defer func() { runErr = errors.Join(runErr, cleanup()) }()
 	stop := context.AfterFunc(ctx, func() { listener.Close() })
 	defer stop()
-	if ctx.Err() != nil || !brokerEndpoint.current() || !relay.current() ||
+	if ctx.Err() != nil || !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
+		!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
 		!time.Now().Before(authority.Expires) {
 		return invalid
 	}
@@ -75,7 +76,9 @@ func runCooperative(ctx context.Context, authority cooperativeBridgeAuthority,
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !brokerEndpoint.current() || !relay.current() || !time.Now().Before(policy.FD3.Expires) {
+		if !cooperativeEndpointCurrent(authority.BrokerRecord, brokerEndpoint) ||
+			!cooperativeEndpointCurrent(authority.RelayRecord, relay) ||
+			!time.Now().Before(policy.FD3.Expires) {
 			return errors.New("cooperative authority or endpoint expired")
 		}
 		if listener.SetDeadline(time.Now().Add(250*time.Millisecond)) != nil {

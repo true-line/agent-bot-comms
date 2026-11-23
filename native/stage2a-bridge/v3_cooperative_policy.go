@@ -20,9 +20,9 @@ func (b *broker) cooperativeMemberPolicy(ctx context.Context,
 		ReservationSHA string `json:"reservation_sha256"`
 		AssignmentSHA  string `json:"bridge_assignment_envelope_sha256"`
 	}{a.ReservationSHA, a.AssignmentSHA}
-	if !brokerEndpoint.current() ||
+	if !cooperativeEndpointCurrent(a.BrokerRecord, brokerEndpoint) ||
 		b.call(ctx, "cooperative-member-policy", "bridge.member-policy.v3", request, &result) != nil ||
-		!brokerEndpoint.current() {
+		!cooperativeEndpointCurrent(a.BrokerRecord, brokerEndpoint) {
 		return v3Authority{}, invalid
 	}
 	return verifyCooperativePolicy(result, a, pin, brokerEndpoint, relayEndpoint, time.Now())

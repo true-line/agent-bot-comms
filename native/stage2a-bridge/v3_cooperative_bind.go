@@ -56,13 +56,20 @@ func cooperativeProof(key []byte, nonce string, a cooperativeBridgeAuthority) (s
 // receipt digest is H's canonical bind record, later joined by A through FD5.
 func (b *broker) bindCooperative(ctx context.Context, a cooperativeBridgeAuthority,
 	key []byte, brokerEndpoint endpoint) (string, error) {
+	return b.bindCooperativeChecked(ctx, a, key, func() bool {
+		return cooperativeEndpointCurrent(a.BrokerRecord, brokerEndpoint)
+	})
+}
+
+func (b *broker) bindCooperativeChecked(ctx context.Context, a cooperativeBridgeAuthority,
+	key []byte, current func() bool) (string, error) {
 	defer clear(key)
 	var challenge cooperativeChallenge
 	if b.call(ctx, "cooperative-challenge", "bridge.bind.cooperative.v3", struct{}{}, &challenge) != nil ||
 		challenge.Algorithm != "hmac-sha256" || challenge.Context != cooperativeBindContext ||
 		challenge.Epoch != a.Epoch || !hexPattern.MatchString(challenge.Nonce) ||
 		!time.Now().Before(challenge.Expires) || challenge.Expires.After(a.Expires) ||
-		!brokerEndpoint.current() {
+		!current() {
 		return "", invalid
 	}
 	proof, err := cooperativeProof(key, challenge.Nonce, a)
@@ -77,7 +84,7 @@ func (b *broker) bindCooperative(ctx context.Context, a cooperativeBridgeAuthori
 	}
 	if b.call(ctx, "cooperative-proof", "bridge.bind.cooperative.v3", request, &result) != nil ||
 		!validDigest(result.ReceiptSHA) || !time.Now().Before(challenge.Expires) ||
-		!brokerEndpoint.current() {
+		!current() {
 		return "", invalid
 	}
 	return result.ReceiptSHA, nil

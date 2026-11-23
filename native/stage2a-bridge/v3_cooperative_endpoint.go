@@ -23,6 +23,18 @@ func cooperativeEndpointIdentityMatches(record map[string]any, actual endpoint, 
 	return actual.Socket.Inode == 0 && actual.Socket.Device == 0
 }
 
+func cooperativeEndpointCurrent(record map[string]any, actual endpoint) bool {
+	if !actual.current() || !cooperativeEndpointIdentityMatches(record, actual, true) {
+		return false
+	}
+	want, err := strconv.ParseInt(field(record, "parent_birthtime_ns"), 10, 64)
+	if err != nil || want <= 0 {
+		return false
+	}
+	got, err := cooperativeBirthtimeNS(filepath.Dir(actual.Path))
+	return err == nil && got == want
+}
+
 // The signed parent tuple is checked before B opens either assigned socket.
 // A created relay has no socket inode yet; the broker and member must exist.
 func cooperativeRuntimeEndpoint(record map[string]any, created bool) (endpoint, error) {

@@ -104,7 +104,7 @@ func TestCooperativeBindUsesOneBrokerConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.conn.Close()
-	receipt, err := b.bindCooperative(ctx, a, key, endpoint)
+	receipt, err := b.bindCooperativeChecked(ctx, a, key, endpoint.current)
 	if err != nil || receipt != "sha256:"+strings.Repeat("f", 64) {
 		t.Fatalf("cooperative bind refused its same-stream H reply: %s %v", receipt, err)
 	}
