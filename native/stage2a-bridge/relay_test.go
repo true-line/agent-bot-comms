@@ -105,7 +105,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration) *fixture 
 					return
 				}
 				result = map[string]string{"bind_receipt": strings.Repeat("1", 64)}
-			case qualifyOp:
+			case "bridge.relay.ingress.v1":
 				time.Sleep(providerDelay)
 				if len(req.Payload) != 2 || req.Payload["model"] != cfg.Model || req.Payload["prompt_sha256"] != cfg.RequestDigest {
 					return
@@ -177,7 +177,7 @@ func (f *fixture) httpWith(t *testing.T, body, extraHeaders, query string) (int,
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(qualificationTimeout + 2*ioTimeout))
+	conn.SetDeadline(time.Now().Add(relayIngressTimeout + 2*ioTimeout))
 	fmt.Fprintf(conn, "POST /v1/messages?%s HTTP/1.1\r\nHost: unix\r\nAccept: application/json\r\nAnthropic-Beta: fixture-beta\r\nAnthropic-Dangerous-Direct-Browser-Access: true\r\nAnthropic-Version: 2023-06-01\r\nContent-Type: application/json\r\nX-App: cli\r\nX-Stainless-Retry-Count: 0\r\nX-Api-Key: fixture-key\r\nX-Claude-Code-Session-Id: 11111111-1111-1111-1111-111111111111\r\n%sContent-Length: %d\r\n\r\n%s", query, extraHeaders, len(body), body)
 	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
@@ -193,7 +193,7 @@ func (f *fixture) httpWith(t *testing.T, body, extraHeaders, query string) (int,
 
 var prompt = `{"context_management":{},"max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"exact prompt"}]},{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}],"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"` + strings.Repeat("a", 64) + `\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"},"model":"probe","output_config":{},"safeguards":{},"stream":true,"system":[],"thinking":{},"tools":[]}`
 
-func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
+func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) {
 	f := newFixture(t, false, 0)
 	f.ready(t)
 	f.peer.Store(322)
@@ -254,7 +254,7 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenQualifiesOnce(t *testing.T) {
 	if status, _ := f.http(t, prompt); status != 409 {
 		t.Fatalf("replay returned %d", status)
 	}
-	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", qualifyOp} {
+	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", "bridge.relay.ingress.v1"} {
 		if got := <-f.requests; got != op {
 			t.Fatalf("op %s != %s", got, op)
 		}
