@@ -103,7 +103,8 @@ func (b *broker) admitCooperativePeer(ctx context.Context, conn *net.UnixConn,
 		MemberLeaseEnvelope string `json:"member_lease_envelope_base64url"`
 		MemberLeaseSHA      string `json:"member_lease_sha256"`
 	}
-	if b.call(ctx, "cooperative-peer-"+nonce, "bridge.peer.cooperative.v3", request, &reply) != nil ||
+	if b.call(ctx, "cooperative-peer-"+digest([]byte(nonce)),
+		"bridge.peer.cooperative.v3", request, &reply) != nil ||
 		!cooperativeEndpointCurrent(a.BrokerRecord, policy.FD3.Broker) ||
 		!cooperativeEndpointCurrent(a.RelayRecord, relay) ||
 		currentCooperativeRelayBirth(relay, ready.BirthNS) != nil ||
