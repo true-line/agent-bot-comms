@@ -13,8 +13,10 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
-  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES,
-  BRIDGE_RELAY_INGRESS, brokerPlugin,
+  BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2,
+  BRIDGE_BIND_V3, BRIDGE_BIND_CHALLENGE_V3, BRIDGE_QUALIFICATION_MESSAGES,
+  BRIDGE_RELAY_INGRESS, STAGE2A_RELAY_PEER_CHALLENGE,
+  BRIDGE_MEMBER_OBSERVE_V3, BRIDGE_MEMBER_ARM_V3, brokerPlugin,
   BRIDGE_RELAY_COMPLETE,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
@@ -350,10 +352,23 @@ const PROTECTED_SCOPE = Object.freeze({
   reservation_digest: `sha256:${'d'.repeat(64)}`,
 });
 const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
+const V3_CONTEXT = 'agent-bot-stage2a-bridge-bind-v3';
+const V3_SCOPE = Object.freeze({ installation_id: 'install_1', start_id: `st_${'a'.repeat(24)}`,
+  plan_id: 'plan_1', plan_digest: 'c'.repeat(64), reservation_digest: `sha256:${'d'.repeat(64)}`,
+  assignment_envelope_sha256: `sha256:${'e'.repeat(64)}`,
+  authority_envelope_sha256: `sha256:${'f'.repeat(64)}`,
+  member_selectors_sha256: `sha256:${'1'.repeat(64)}` });
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
+const PROTECTED_PEER = Object.freeze({ uid: 321, pid: 4101, pid_version: 3,
+  start_seconds: 100, start_micros: 42, parent_pid: 4001, parent_uid: 321,
+  parent_start_seconds: 99, parent_start_micros: 41 });
+const PROTECTED_PEER_CANONICAL = Object.fromEntries(Object.entries(PROTECTED_PEER)
+  .sort(([left], [right]) => left.localeCompare(right)));
+const PROTECTED_PEER_SHA256 = `sha256:${sha256(JSON.stringify(PROTECTED_PEER_CANONICAL))}`;
 
 const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false,
-  relayIngressEnabled = false, relayCompletionEnabled = false) => definePlugin({
+  relayIngressEnabled = false, peerEnabled = false, armEnabled = false,
+  relayCompletionEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
@@ -361,12 +376,36 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
         ? qualificationEnabled() : qualificationEnabled,
       bridgeRelayIngressEnabledV2: () => typeof relayIngressEnabled === 'function'
         ? relayIngressEnabled() : relayIngressEnabled,
+      stage2aRelayPeerChallengeEnabled: () => peerEnabled,
+      stage2aMemberArmExchangeEnabledV3: () => armEnabled,
+      async stage2aMemberObserveV3(input, { connection }, receipt) {
+        log.push(['observe_v3', input, connection, receipt]);
+        return { kind: 'bridge.member.observe.v3.result', observe_nonce: input.observe_nonce };
+      },
+      async stage2aMemberArmV3(input, { connection }, receipt) {
+        log.push(['arm_v3', input, connection, receipt]);
+        return { kind: 'bridge.member.arm.v3.result', arm_nonce: input.arm_nonce,
+          state: 'recorded-pending-aggregate-ready' };
+      },
+      async stage2aRelayPeerChallenge(input, { connection }, receipt) {
+        log.push(['live_peer', input, connection, receipt]);
+        return { verdict: 'verified' };
+      },
       bridgeRelayCompletionEnabledV2: () => typeof relayCompletionEnabled === 'function'
         ? relayCompletionEnabled() : relayCompletionEnabled,
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
           hq_epoch: '1'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async bridgeBindChallengeV3(input, { connection }) {
+        log.push(['challenge_v3', input, connection]);
+        return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context: V3_CONTEXT,
+          hq_epoch: '1'.repeat(64), expires_at: '2026-11-21T20:00:00.000Z' };
+      },
+      async verifyBridgeBindingV3(input, { connection }) {
+        log.push(['bind_v3', input, connection]);
+        return { bind_receipt: '3'.repeat(64) };
       },
       async verifyBridgeBindingV2(input, { connection }) {
         log.push(['bind_v2', input, connection]);
@@ -394,9 +433,11 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
 });
 
 test('B completion reaches HQ only after one bound ingress and acknowledges its persisted receipt', async () => {
+  assert.equal(PROTECTED_PEER_SHA256,
+    'sha256:ad8a2b08d26de9cb382b7a7f77f2670cdd91be7187f5dcbf563e0ba1118446f9');
   const log = [];
   const host = createTestHost({ plugins: [
-    protectedAdmission(log, PROTECTED_CONTEXT, false, true, true),
+    protectedAdmission(log, PROTECTED_CONTEXT, false, true, false, false, true),
     brokerPlugin({ enableBridgeRelayIngress: true, enableBridgeRelayCompletion: true }),
   ] });
   await host.start();
@@ -408,6 +449,7 @@ test('B completion reaches HQ only after one bound ingress and acknowledges its 
     const frame = {
       selectors: PROTECTED_SCOPE,
       bind_receipt_sha256: `sha256:${createHash('sha256').update(receipt).digest('hex')}`,
+      peer: PROTECTED_PEER, peer_sha256: PROTECTED_PEER_SHA256,
       request_sha256: requestSHA256, prompt_sha256: promptSHA256, model: 'probe',
       response_wire_sha256: `sha256:${'c'.repeat(64)}`, response_wire_bytes: 256,
       http_status: 200, write_started_at: '2026-11-24T12:00:00Z',
@@ -418,7 +460,9 @@ test('B completion reaches HQ only after one bound ingress and acknowledges its 
     await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
     await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
     assert.equal(log.some(([kind]) => kind === 'relay_complete'), false);
-    const ingress = { model: 'probe', prompt_sha256: requestSHA256 };
+    const ingress = { model: 'probe', prompt_sha256: requestSHA256, peer: PROTECTED_PEER };
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS,
+      { model: 'probe', prompt_sha256: requestSHA256 }, { connection }), code('host.invalid_request'));
     assert.deepEqual(await host.brokerAccept(BRIDGE_RELAY_INGRESS, ingress, { connection }), { accepted: true });
     await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS, ingress, { connection }), code('caller_mismatch'));
     assert.deepEqual(await host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), { accepted: true });
@@ -436,7 +480,7 @@ test('B completion refuses mismatch and an HQ without completion authority', asy
   for (const completionEnabled of [false, true]) {
     const log = [];
     const host = createTestHost({ plugins: [
-      protectedAdmission(log, PROTECTED_CONTEXT, false, true, completionEnabled),
+      protectedAdmission(log, PROTECTED_CONTEXT, false, true, false, false, completionEnabled),
       brokerPlugin({ enableBridgeRelayIngress: true, enableBridgeRelayCompletion: true }),
     ] });
     await host.start();
@@ -445,7 +489,7 @@ test('B completion refuses mismatch and an HQ without completion authority', asy
       await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
       await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
       await host.brokerAccept(BRIDGE_RELAY_INGRESS,
-        { model: 'probe', prompt_sha256: `sha256:${'a'.repeat(64)}` }, { connection });
+        { model: 'probe', prompt_sha256: `sha256:${'a'.repeat(64)}`, peer: PROTECTED_PEER }, { connection });
       await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE,
         { request_sha256: `sha256:${'b'.repeat(64)}` }, { connection }), code('caller_mismatch'));
       assert.equal(log.some(([kind]) => kind === 'relay_complete'), false);
@@ -455,9 +499,39 @@ test('B completion refuses mismatch and an HQ without completion authority', asy
   }
 });
 
-test('B relay ingress delegates opaque frames only over a live v2 bridge binding', async () => {
+test('B completion refuses a changed measured peer or peer digest before HQ', async () => {
+  for (const changed of ['peer', 'peer_sha256']) {
+    const log = [];
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, false, true, false, false, true),
+      brokerPlugin({ enableBridgeRelayIngress: true, enableBridgeRelayCompletion: true }),
+    ] });
+    await host.start();
+    try {
+      const connection = `b_peer_${changed}`;
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+      await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+      const requestSHA256 = `sha256:${'a'.repeat(64)}`;
+      await host.brokerAccept(BRIDGE_RELAY_INGRESS,
+        { model: 'probe', prompt_sha256: requestSHA256, peer: PROTECTED_PEER }, { connection });
+      const frame = { selectors: PROTECTED_SCOPE,
+        bind_receipt_sha256: `sha256:${sha256('2'.repeat(64))}`,
+        peer: changed === 'peer' ? { ...PROTECTED_PEER, pid: 4102 } : PROTECTED_PEER,
+        peer_sha256: changed === 'peer_sha256' ? `sha256:${'0'.repeat(64)}` : PROTECTED_PEER_SHA256,
+        request_sha256: requestSHA256, prompt_sha256: `sha256:${'b'.repeat(64)}`,
+        model: 'probe', response_wire_sha256: `sha256:${'c'.repeat(64)}`,
+        response_wire_bytes: 256, http_status: 200,
+        write_started_at: '2026-11-24T12:00:00Z',
+        write_completed_at: '2026-11-24T12:00:01Z' };
+      await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
+      assert.equal(log.some(([kind]) => kind === 'relay_complete'), false);
+    } finally { await host.stop(); }
+  }
+});
+
+test('B relay ingress delegates measured frames only over a live v2 bridge binding', async () => {
   const log = [];
-  const frame = { opaque_frame: 'base64:fixture', sequence: 7 };
+  const frame = { model: 'probe', prompt_sha256: `sha256:${'a'.repeat(64)}`, peer: PROTECTED_PEER };
   const host = createTestHost({ plugins: [
     protectedAdmission(log, PROTECTED_CONTEXT, false, true),
     brokerPlugin({ enableBridgeRelayIngress: true }),
@@ -493,6 +567,101 @@ test('packaged B relay ingress stays closed until HQ supplies its private relay 
     assert.equal(log.some(([kind]) => kind === 'relay_ingress'), false);
   } finally {
     await host.stop();
+  }
+});
+
+test('live peer challenge refuses a v2 bridge even when both optional gates are enabled', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, false, true),
+    brokerPlugin({ enableRelayPeerChallenge: true }),
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_v2_only';
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    await assert.rejects(host.brokerAccept(STAGE2A_RELAY_PEER_CHALLENGE,
+      { rpc_id: `rpc_${'a'.repeat(32)}` }, { connection }), code('caller_mismatch'));
+    assert.equal(log.some(([kind]) => kind === 'live_peer'), false);
+  } finally { await host.stop(); }
+});
+
+test('v3 bridge binds eight exact selectors then routes live peer on that bound connection', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [protectedAdmission(log, PROTECTED_CONTEXT, false, false, true),
+    brokerPlugin({ enableRelayPeerChallenge: true })] });
+  await host.start();
+  try {
+    const connection = 'b_v3';
+    await assert.rejects(host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3,
+      { ...V3_SCOPE, launch_id: `ln_${'a'.repeat(24)}` }, { connection }), code('host.invalid_request'));
+    assert.equal(log.some(([kind]) => kind === 'challenge_v3'), false);
+    const challenge = await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+    assert.equal(challenge.context, V3_CONTEXT);
+    const receipt = await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+    assert.equal(receipt.bind_receipt, '3'.repeat(64));
+    const frame = { rpc_id: `rpc_${'a'.repeat(32)}` };
+    assert.deepEqual(await host.brokerAccept(STAGE2A_RELAY_PEER_CHALLENGE, frame, { connection }),
+      { verdict: 'verified' });
+    assert.deepEqual(log.at(-1), ['live_peer', frame, connection, receipt.bind_receipt]);
+    await assert.rejects(host.brokerAccept('task.commit', {}, { connection }), code('caller_mismatch'));
+  } finally { await host.stop(); }
+});
+
+test('two-member observe and arm use only the same bound v3 broker stream', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, false, false, true),
+    brokerPlugin({ enableMemberArmExchange: true }),
+  ] });
+  await host.start();
+  try {
+    const observe = { kind: 'bridge.member.observe.v3.request', selectors: { ...V3_SCOPE },
+      member_id: 'm_lead', member_selector: `mb_${'2'.repeat(64)}`,
+      observe_nonce: '3'.repeat(64) };
+    const arm = { ...observe, kind: 'bridge.member.arm.v3.request', arm_nonce: '4'.repeat(64),
+      child_observation_envelope_sha256: `sha256:${'5'.repeat(64)}`,
+      bridge_arm: { member_id: 'm_lead' },
+      bridge_arm_receipt_sha256: `sha256:${'6'.repeat(64)}` };
+    const connection = 'b_v3_arm';
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3, observe,
+      { connection }), code('caller_mismatch'));
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3,
+      { ...observe, selectors: { ...observe.selectors, start_id: `st_${'0'.repeat(24)}` } },
+      { connection }), code('host.invalid_request'));
+    assert.deepEqual(await host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3, observe, { connection }),
+      { kind: 'bridge.member.observe.v3.result', observe_nonce: observe.observe_nonce });
+    assert.deepEqual(await host.brokerAccept(BRIDGE_MEMBER_ARM_V3, arm, { connection }),
+      { kind: 'bridge.member.arm.v3.result', arm_nonce: arm.arm_nonce,
+        state: 'recorded-pending-aggregate-ready' });
+    assert.deepEqual(log.slice(-2).map(([kind, , conn]) => [kind, conn]),
+      [['observe_v3', connection], ['arm_v3', connection]]);
+    await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_ARM_V3, arm,
+      { connection: 'other' }), code('caller_mismatch'));
+  } finally { await host.stop(); }
+});
+
+test('two-member arm remains closed when either optional gate is absent', async () => {
+  for (const [enabled, hqEnabled] of [[false, true], [true, false]]) {
+    const log = [];
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, false, false, false, hqEnabled),
+      brokerPlugin({ enableMemberArmExchange: enabled }),
+    ] });
+    await host.start();
+    try {
+      const connection = 'b_v3_closed';
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V3, V3_SCOPE, { connection });
+      await host.brokerAccept(BRIDGE_BIND_V3, { ...V3_SCOPE, proof: 'a'.repeat(64) }, { connection });
+      await assert.rejects(host.brokerAccept(BRIDGE_MEMBER_OBSERVE_V3,
+        { kind: 'bridge.member.observe.v3.request', selectors: V3_SCOPE,
+          member_id: 'm_lead', member_selector: `mb_${'2'.repeat(64)}`,
+          observe_nonce: '3'.repeat(64) }, { connection }), code('caller_mismatch'));
+      assert.equal(log.some(([kind]) => kind === 'observe_v3'), false);
+    } finally { await host.stop(); }
   }
 });
 

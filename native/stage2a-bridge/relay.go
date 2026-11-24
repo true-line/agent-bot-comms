@@ -144,6 +144,14 @@ func (e endpoint) current() bool {
 }
 
 type checkPeer func(*net.UnixConn) (uint32, error)
+type capturePeer func(*net.UnixConn) (peerProcessSnapshot, error)
+
+func validRelayPeer(peer peerProcessSnapshot, uid uint32) bool {
+	return peer.Peer.UID == uid && peer.ParentUID == uid &&
+		peer.Peer.PID > 1 && peer.Peer.PIDVersion > 0 &&
+		peer.StartSeconds > 0 && peer.StartMicros < 1000000 &&
+		peer.ParentPID > 1 && peer.ParentStartSeconds > 0 && peer.ParentStartMicros < 1000000
+}
 
 func peerMatches(conn *net.UnixConn, want uint32, check checkPeer) bool {
 	if check == nil {
@@ -154,22 +162,51 @@ func peerMatches(conn *net.UnixConn, want uint32, check checkPeer) bool {
 }
 
 type brokerReply struct {
-	ID     string          `json:"id"`
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result"`
+	ID          string          `json:"id"`
+	OK          bool            `json:"ok"`
+	Result      json.RawMessage `json:"result"`
+	HostRefusal *struct {
+		Code          string `json:"code"`
+		Explanation   string `json:"explanation"`
+		CorrelationID string `json:"correlation_id"`
+	} `json:"host_refusal"`
+	Refusal json.RawMessage `json:"refusal"`
+}
+
+func decodeBrokerResult(data []byte, id, op string, out any) error {
+	var reply brokerReply
+	if decode(data, &reply) != nil || reply.ID != id {
+		return invalid
+	}
+	if !reply.OK {
+		if (op == "bridge.member.observe.v3" || op == "bridge.member.observe.cooperative.v3") && reply.HostRefusal != nil &&
+			reply.HostRefusal.Code == "host.launch_busy" &&
+			reply.HostRefusal.Explanation != "" &&
+			reply.HostRefusal.CorrelationID != "" &&
+			len(reply.Refusal) == 0 && len(reply.Result) == 0 {
+			return errObservationPending
+		}
+		return invalid
+	}
+	if reply.HostRefusal != nil || len(reply.Refusal) != 0 || decode(reply.Result, out) != nil {
+		return invalid
+	}
+	return nil
 }
 
 type completionPayload struct {
-	Selectors          selectors `json:"selectors"`
-	BindReceiptSHA256  string    `json:"bind_receipt_sha256"`
-	RequestSHA256      string    `json:"request_sha256"`
-	PromptSHA256       string    `json:"prompt_sha256"`
-	Model              string    `json:"model"`
-	ResponseWireSHA256 string    `json:"response_wire_sha256"`
-	ResponseWireBytes  int       `json:"response_wire_bytes"`
-	HTTPStatus         int       `json:"http_status"`
-	WriteStartedAt     time.Time `json:"write_started_at"`
-	WriteCompletedAt   time.Time `json:"write_completed_at"`
+	Selectors          selectors      `json:"selectors"`
+	BindReceiptSHA256  string         `json:"bind_receipt_sha256"`
+	Peer               map[string]any `json:"peer"`
+	PeerSHA256         string         `json:"peer_sha256"`
+	RequestSHA256      string         `json:"request_sha256"`
+	PromptSHA256       string         `json:"prompt_sha256"`
+	Model              string         `json:"model"`
+	ResponseWireSHA256 string         `json:"response_wire_sha256"`
+	ResponseWireBytes  int            `json:"response_wire_bytes"`
+	HTTPStatus         int            `json:"http_status"`
+	WriteStartedAt     time.Time      `json:"write_started_at"`
+	WriteCompletedAt   time.Time      `json:"write_completed_at"`
 }
 
 type broker struct {
@@ -232,7 +269,7 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 	}
 	timeout := ioTimeout
 	switch op {
-	case relayIngressOp:
+	case relayIngressOp, "bridge.member-policy.v3", "bridge.ready.cooperative.v3":
 		timeout = relayIngressTimeout
 	case relayCompletionOp:
 		timeout = relayCompletionTimeout
@@ -247,11 +284,7 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 	case <-timer.C:
 		return invalid
 	case data := <-b.frames:
-		var reply brokerReply
-		if decode(data, &reply) != nil || reply.ID != id || !reply.OK || decode(reply.Result, out) != nil {
-			return invalid
-		}
-		return nil
+		return decodeBrokerResult(data, id, op, out)
 	}
 }
 
@@ -288,7 +321,8 @@ func (b *broker) bind(ctx context.Context, config assignment, key []byte) (strin
 	return digest([]byte(bound.Receipt)), nil
 }
 
-func run(ctx context.Context, config assignment, key []byte, status io.WriteCloser, check checkPeer) (runErr error) {
+func run(ctx context.Context, config assignment, key []byte, status io.WriteCloser,
+	check checkPeer, capture capturePeer) (runErr error) {
 	defer clear(key)
 	b, err := openBroker(ctx, config, check)
 	if err != nil {
@@ -363,8 +397,17 @@ func run(ctx context.Context, config assignment, key []byte, status io.WriteClos
 			conn.Close()
 			continue
 		}
+		if capture == nil {
+			conn.Close()
+			continue
+		}
+		peer, err := capture(conn)
+		if err != nil || !validRelayPeer(peer, config.RunnerUID) {
+			conn.Close()
+			continue
+		}
 		stopConn := context.AfterFunc(ctx, func() { conn.Close() })
-		err = serve(ctx, conn, b, config, relay, receipt, &attempted)
+		err = serve(ctx, conn, b, config, relay, receipt, peer, capture, &attempted)
 		stopConn()
 		conn.Close()
 		if err != nil {

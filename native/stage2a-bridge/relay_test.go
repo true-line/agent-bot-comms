@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -24,6 +25,7 @@ type fixture struct {
 	config           assignment
 	status           chan string
 	peer             atomic.Uint32
+	peerStart        atomic.Uint64
 	requests         chan string
 	completed        chan completionPayload
 	rejectCompletion atomic.Bool
@@ -37,6 +39,24 @@ type statusWriter struct{ status chan string }
 func (s statusWriter) Write(p []byte) (int, error) { s.status <- string(p); return len(p), nil }
 func (s statusWriter) Close() error                { return nil }
 
+func (f *fixture) peerSnapshot() peerProcessSnapshot {
+	uid := f.peer.Load()
+	return peerProcessSnapshot{
+		Peer:         peerProcessIdentity{UID: uid, PID: 4101, PIDVersion: 3},
+		StartSeconds: f.peerStart.Load(), StartMicros: 42,
+		ParentPID: 4001, ParentUID: uid, ParentStartSeconds: 99, ParentStartMicros: 41,
+	}
+}
+
+func sameFixturePeer(got any, expected peerProcessSnapshot) bool {
+	actual, err := json.Marshal(got)
+	if err != nil {
+		return false
+	}
+	want, err := json.Marshal(cooperativePeerValue(expected))
+	return err == nil && bytes.Equal(actual, want)
+}
+
 func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBody string) *fixture {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "b-")
@@ -46,6 +66,8 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	f := &fixture{status: make(chan string, 1), requests: make(chan string, 4), completed: make(chan completionPayload, 1), done: make(chan error, 1), drop: make(chan struct{})}
 	f.peer.Store(321)
+	f.peerStart.Store(100)
+	expectedPeer := f.peerSnapshot()
 	brokerDir, relayDir := filepath.Join(dir, "broker"), filepath.Join(dir, "relay")
 	if os.Mkdir(brokerDir, 0750) != nil || os.Mkdir(relayDir, 0750) != nil {
 		t.Fatal("could not provision paths")
@@ -110,7 +132,9 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				result = map[string]string{"bind_receipt": strings.Repeat("1", 64)}
 			case "bridge.relay.ingress.v1":
 				time.Sleep(providerDelay)
-				if len(req.Payload) != 2 || req.Payload["model"] != cfg.Model || req.Payload["prompt_sha256"] != cfg.RequestDigest {
+				if len(req.Payload) != 3 || req.Payload["model"] != cfg.Model ||
+					req.Payload["prompt_sha256"] != cfg.RequestDigest ||
+					!sameFixturePeer(req.Payload["peer"], expectedPeer) {
 					return
 				}
 				result = map[string]any{"model": cfg.Model, "text": "fixture response", "stop_reason": "end_turn",
@@ -118,9 +142,12 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 			case relayCompletionOp:
 				encoded, err := json.Marshal(req.Payload)
 				var completion completionPayload
+				peerBytes, _ := json.Marshal(cooperativePeerValue(expectedPeer))
 				if err != nil || json.Unmarshal(encoded, &completion) != nil ||
 					completion.Selectors != cfg.Selectors ||
 					completion.BindReceiptSHA256 != digest([]byte(strings.Repeat("1", 64))) ||
+					!sameFixturePeer(completion.Peer, expectedPeer) ||
+					completion.PeerSHA256 != digest(peerBytes) ||
 					completion.RequestSHA256 != cfg.RequestDigest ||
 					completion.PromptSHA256 != digest([]byte("exact prompt")) || completion.Model != cfg.Model ||
 					completion.HTTPStatus != http.StatusOK || completion.ResponseWireBytes <= 0 ||
@@ -154,6 +181,8 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				return cfg.HQUID, nil
 			}
 			return f.peer.Load(), nil
+		}, func(*net.UnixConn) (peerProcessSnapshot, error) {
+			return f.peerSnapshot(), nil
 		})
 	}()
 	return f
@@ -260,6 +289,11 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) 
 		t.Fatalf("wrong peer received HTTP %d", status)
 	}
 	f.peer.Store(321)
+	f.peerStart.Store(0)
+	if status, _ := f.http(t, prompt); status != 0 {
+		t.Fatalf("unmeasured peer received HTTP %d", status)
+	}
+	f.peerStart.Store(100)
 	for _, body := range []string{
 		strings.Replace(prompt, "exact prompt", "wrong prompt", 1),
 		strings.Replace(prompt, `"stream":true`, `"stream":true,"runtime_id":"other"`, 1),
@@ -357,6 +391,7 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 	completion := <-f.completed
 	if completion.ResponseWireSHA256 != digest(wire) || completion.ResponseWireBytes != len(wire) ||
 		completion.HTTPStatus != http.StatusOK || completion.PromptSHA256 != digest([]byte("exact prompt")) ||
+		completion.PeerSHA256 != "sha256:ad8a2b08d26de9cb382b7a7f77f2670cdd91be7187f5dcbf563e0ba1118446f9" ||
 		completion.PromptSHA256 == completion.RequestSHA256 {
 		t.Fatalf("completion does not bind exact client wire: %+v", completion)
 	}
@@ -445,6 +480,26 @@ func TestCompletionWaitsForHQBeyondDefaultBrokerTimeout(t *testing.T) {
 	case err := <-f.done:
 		t.Fatalf("relay stopped before delayed HQ acknowledgement: %v", err)
 	default:
+	}
+}
+
+func TestChangedPeerBeforeHQCompletionRefusesPositiveRelay(t *testing.T) {
+	f := newFixture(t, false, 0, prompt)
+	f.completionDelay.Store(int64(500 * time.Millisecond))
+	f.ready(t)
+	response := make(chan []byte, 1)
+	go func() { response <- f.rawHTTP(t, prompt) }()
+	if completion := <-f.completed; completion.PeerSHA256 == "" {
+		t.Fatal("completion omitted measured peer digest")
+	}
+	f.peerStart.Store(101)
+	wire := <-response
+	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") {
+		t.Fatalf("response was not written before completion: %s", wire)
+	}
+	f.stopped(t, "broker completion rejected")
+	if _, err := os.Lstat(f.config.Relay.Path); !os.IsNotExist(err) {
+		t.Fatalf("relay remained after peer changed: %v", err)
 	}
 }
 
