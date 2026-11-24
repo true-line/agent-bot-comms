@@ -21,12 +21,17 @@ import (
 )
 
 const (
-	bindContext       = "agent-bot-stage2a-bridge-bind-v2"
-	relayIngressOp    = "bridge.relay.ingress.v1"
-	relayCompletionOp = "bridge.relay.complete.v1"
-	ioTimeout         = 5 * time.Second
+	bindContext             = "agent-bot-stage2a-bridge-bind-v2"
+	completionSubkeyContext = "agent-bot-stage2a-b-completion-subkey-v1"
+	completionOriginContext = "agent-bot-stage2a-b-completion-origin-v1"
+	relayIngressOp          = "bridge.relay.ingress.v1"
+	relayPrewriteOp         = "bridge.relay.prewrite.v1"
+	relayCompletionOp       = "bridge.relay.complete.v1"
+	ioTimeout               = 5 * time.Second
 	// HQ may perform a lease check, authorize the turn, and recheck the lease.
 	relayIngressTimeout = 20 * time.Second
+	// HQ waits for Machine's signed live-child prewrite observation.
+	relayPrewriteTimeout = 20 * time.Second
 	// HQ rechecks live A, then waits for Machine's signed positive receipt.
 	relayCompletionTimeout = 20 * time.Second
 )
@@ -194,9 +199,10 @@ func decodeBrokerResult(data []byte, id, op string, out any) error {
 	return nil
 }
 
-type completionPayload struct {
+type completionCore struct {
 	Selectors          selectors      `json:"selectors"`
 	BindReceiptSHA256  string         `json:"bind_receipt_sha256"`
+	PrewriteReceipt    string         `json:"prewrite_receipt"`
 	Peer               map[string]any `json:"peer"`
 	PeerSHA256         string         `json:"peer_sha256"`
 	RequestSHA256      string         `json:"request_sha256"`
@@ -207,6 +213,50 @@ type completionPayload struct {
 	HTTPStatus         int            `json:"http_status"`
 	WriteStartedAt     time.Time      `json:"write_started_at"`
 	WriteCompletedAt   time.Time      `json:"write_completed_at"`
+}
+
+type completionPayload struct {
+	completionCore
+	CompletionOriginMAC string `json:"completion_origin_mac"`
+}
+
+func deriveCompletionSubkey(key []byte, reservation string) ([]byte, error) {
+	if len(key) != 32 || !validDigest(reservation) {
+		return nil, invalid
+	}
+	mac := hmac.New(sha256.New, key)
+	io.WriteString(mac, completionSubkeyContext)
+	mac.Write([]byte{0})
+	io.WriteString(mac, reservation)
+	return mac.Sum(nil), nil
+}
+
+func completionOriginMAC(subkey []byte, core completionCore) (string, error) {
+	if len(subkey) != 32 {
+		return "", invalid
+	}
+	canonical, err := canonicalJSONValue(core)
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, subkey)
+	io.WriteString(mac, completionOriginContext)
+	mac.Write([]byte{0})
+	mac.Write(canonical)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+type prewritePayload struct {
+	Selectors          selectors      `json:"selectors"`
+	BindReceiptSHA256  string         `json:"bind_receipt_sha256"`
+	RequestSHA256      string         `json:"request_sha256"`
+	PromptSHA256       string         `json:"prompt_sha256"`
+	Model              string         `json:"model"`
+	Peer               map[string]any `json:"peer"`
+	PeerSHA256         string         `json:"peer_sha256"`
+	ResponseWireSHA256 string         `json:"response_wire_sha256"`
+	ResponseWireBytes  int            `json:"response_wire_bytes"`
+	HTTPStatus         int            `json:"http_status"`
 }
 
 type broker struct {
@@ -271,6 +321,8 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 	switch op {
 	case relayIngressOp, "bridge.member-policy.v3", "bridge.ready.cooperative.v3":
 		timeout = relayIngressTimeout
+	case relayPrewriteOp:
+		timeout = relayPrewriteTimeout
 	case relayCompletionOp:
 		timeout = relayCompletionTimeout
 	}
@@ -322,7 +374,8 @@ func (b *broker) bind(ctx context.Context, config assignment, key []byte) (strin
 }
 
 func run(ctx context.Context, config assignment, key []byte, status io.WriteCloser,
-	check checkPeer, capture capturePeer) (runErr error) {
+	check checkPeer, capture capturePeer,
+	writeSuccess func(*net.UnixConn, preparedHTTP) (httpWrite, error)) (runErr error) {
 	defer clear(key)
 	b, err := openBroker(ctx, config, check)
 	if err != nil {
@@ -338,6 +391,12 @@ func run(ctx context.Context, config assignment, key []byte, status io.WriteClos
 		case <-ctx.Done():
 		}
 	}()
+	// Keep only a purpose-scoped subkey after bind clears the raw FD4 proof.
+	completionKey, err := deriveCompletionSubkey(key, config.Selectors.Reservation)
+	if err != nil {
+		return errors.New("completion subkey derivation rejected")
+	}
+	defer clear(completionKey)
 	receipt, err := b.bind(ctx, config, key)
 	if err != nil {
 		return errors.New("broker bind rejected")
@@ -407,7 +466,8 @@ func run(ctx context.Context, config assignment, key []byte, status io.WriteClos
 			continue
 		}
 		stopConn := context.AfterFunc(ctx, func() { conn.Close() })
-		err = serve(ctx, conn, b, config, relay, receipt, peer, capture, &attempted)
+		err = serve(ctx, conn, b, config, relay, receipt, peer, capture, completionKey,
+			&attempted, writeSuccess)
 		stopConn()
 		conn.Close()
 		if err != nil {

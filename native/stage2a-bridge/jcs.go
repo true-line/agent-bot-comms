@@ -92,6 +92,24 @@ func jcsValue(value any, out *bytes.Buffer) error {
 	return nil
 }
 
+func canonicalJSONValue(value any) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, invalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var decoded any
+	if decoder.Decode(&decoded) != nil {
+		return nil, invalid
+	}
+	var canonical bytes.Buffer
+	if jcsValue(decoded, &canonical) != nil {
+		return nil, invalid
+	}
+	return canonical.Bytes(), nil
+}
+
 func canonicalSignedJSON(data []byte) (map[string]any, error) {
 	return canonicalSignedJSONBounded(data, 16384)
 }
