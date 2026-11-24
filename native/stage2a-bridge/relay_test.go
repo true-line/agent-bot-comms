@@ -27,6 +27,7 @@ type fixture struct {
 	requests         chan string
 	completed        chan completionPayload
 	rejectCompletion atomic.Bool
+	completionDelay  atomic.Int64
 	done             chan error
 	drop             chan struct{}
 }
@@ -128,6 +129,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 					return
 				}
 				f.completed <- completion
+				time.Sleep(time.Duration(f.completionDelay.Load()))
 				result = map[string]bool{"accepted": !f.rejectCompletion.Load()}
 			default:
 				return
@@ -424,6 +426,24 @@ func TestCompletionRefusalStopsRelayAfterOneWrite(t *testing.T) {
 	select {
 	case op := <-f.requests:
 		t.Fatalf("rejected completion retried: %s", op)
+	default:
+	}
+}
+
+func TestCompletionWaitsForHQBeyondDefaultBrokerTimeout(t *testing.T) {
+	f := newFixture(t, false, 0, prompt)
+	f.completionDelay.Store(int64(ioTimeout + 200*time.Millisecond))
+	f.ready(t)
+	wire := f.rawHTTP(t, prompt)
+	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") {
+		t.Fatalf("delayed HQ acknowledgement lost response: %s", wire)
+	}
+	if completion := <-f.completed; completion.ResponseWireSHA256 != digest(wire) {
+		t.Fatalf("delayed completion lost exact wire binding: %+v", completion)
+	}
+	select {
+	case err := <-f.done:
+		t.Fatalf("relay stopped before delayed HQ acknowledgement: %v", err)
 	default:
 	}
 }

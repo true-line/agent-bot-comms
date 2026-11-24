@@ -27,6 +27,8 @@ const (
 	ioTimeout         = 5 * time.Second
 	// HQ may perform a lease check, authorize the turn, and recheck the lease.
 	relayIngressTimeout = 20 * time.Second
+	// HQ rechecks live A, then waits for Machine's signed positive receipt.
+	relayCompletionTimeout = 20 * time.Second
 )
 
 var (
@@ -229,8 +231,11 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 		return invalid
 	}
 	timeout := ioTimeout
-	if op == relayIngressOp {
+	switch op {
+	case relayIngressOp:
 		timeout = relayIngressTimeout
+	case relayCompletionOp:
+		timeout = relayCompletionTimeout
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
