@@ -15,6 +15,7 @@ import { agentBotHq, SOURCE, VENDOR } from './hq-agent-bot-hq.mjs';
 import {
   BRIDGE_BIND, BRIDGE_BIND_CHALLENGE, BRIDGE_BIND_V2, BRIDGE_BIND_CHALLENGE_V2, BRIDGE_QUALIFICATION_MESSAGES,
   BRIDGE_RELAY_INGRESS, brokerPlugin,
+  BRIDGE_RELAY_COMPLETE,
 } from '../lib/hq-plugin/broker.mjs';
 import plugin from '../lib/hq-plugin/plugin.mjs';
 import { checkPlugin, createTestHost, definePlugin } from '../lib/vendor/agent-bot-sdk/index.mjs';
@@ -351,7 +352,8 @@ const PROTECTED_SCOPE = Object.freeze({
 const PROTECTED_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
 const PROTECTED_FRAME = { ...PROTECTED_SCOPE, proof: 'e'.repeat(64) };
 
-const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false, relayIngressEnabled = false) => definePlugin({
+const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabled = false,
+  relayIngressEnabled = false, relayCompletionEnabled = false) => definePlugin({
   name: 'hq-admission', version: '0.1.0', hostApi: 1,
   async init() {
     return { provides: {
@@ -359,6 +361,8 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
         ? qualificationEnabled() : qualificationEnabled,
       bridgeRelayIngressEnabledV2: () => typeof relayIngressEnabled === 'function'
         ? relayIngressEnabled() : relayIngressEnabled,
+      bridgeRelayCompletionEnabledV2: () => typeof relayCompletionEnabled === 'function'
+        ? relayCompletionEnabled() : relayCompletionEnabled,
       async bridgeBindChallengeV2(input, { connection }) {
         log.push(['challenge_v2', input, connection]);
         return { nonce: 'a'.repeat(64), algorithm: 'hmac-sha256', context,
@@ -380,9 +384,75 @@ const protectedAdmission = (log, context = PROTECTED_CONTEXT, qualificationEnabl
         log.push(['relay_ingress', input, connection, receipt]);
         return { accepted: true };
       },
+      async completeBridgeRelayV2(input, { connection }, receipt) {
+        log.push(['relay_complete', input, connection, receipt]);
+        return { accepted: true };
+      },
       forgetBridgeConnection(connection, receipt) { log.push(['forget_bridge', connection, receipt]); },
     } };
   },
+});
+
+test('B completion reaches HQ only after one bound ingress and acknowledges its persisted receipt', async () => {
+  const log = [];
+  const host = createTestHost({ plugins: [
+    protectedAdmission(log, PROTECTED_CONTEXT, false, true, true),
+    brokerPlugin({ enableBridgeRelayIngress: true, enableBridgeRelayCompletion: true }),
+  ] });
+  await host.start();
+  try {
+    const connection = 'b_completion';
+    const requestSHA256 = `sha256:${'a'.repeat(64)}`;
+    const promptSHA256 = `sha256:${'b'.repeat(64)}`;
+    const receipt = '2'.repeat(64);
+    const frame = {
+      selectors: PROTECTED_SCOPE,
+      bind_receipt_sha256: `sha256:${createHash('sha256').update(receipt).digest('hex')}`,
+      request_sha256: requestSHA256, prompt_sha256: promptSHA256, model: 'probe',
+      response_wire_sha256: `sha256:${'c'.repeat(64)}`, response_wire_bytes: 256,
+      http_status: 200, write_started_at: '2026-11-24T12:00:00Z',
+      write_completed_at: '2026-11-24T12:00:01Z',
+    };
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
+    await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+    await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
+    assert.equal(log.some(([kind]) => kind === 'relay_complete'), false);
+    const ingress = { model: 'probe', prompt_sha256: requestSHA256 };
+    assert.deepEqual(await host.brokerAccept(BRIDGE_RELAY_INGRESS, ingress, { connection }), { accepted: true });
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_INGRESS, ingress, { connection }), code('caller_mismatch'));
+    assert.deepEqual(await host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), { accepted: true });
+    assert.deepEqual(log.at(-1), ['relay_complete', frame, connection, receipt]);
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
+    assert.equal(log.filter(([kind]) => kind === 'relay_complete').length, 1);
+    await host.brokerClosed(connection);
+    await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE, frame, { connection }), code('caller_mismatch'));
+  } finally {
+    await host.stop();
+  }
+});
+
+test('B completion refuses mismatch and an HQ without completion authority', async () => {
+  for (const completionEnabled of [false, true]) {
+    const log = [];
+    const host = createTestHost({ plugins: [
+      protectedAdmission(log, PROTECTED_CONTEXT, false, true, completionEnabled),
+      brokerPlugin({ enableBridgeRelayIngress: true, enableBridgeRelayCompletion: true }),
+    ] });
+    await host.start();
+    try {
+      const connection = `b_completion_${completionEnabled}`;
+      await host.brokerAccept(BRIDGE_BIND_CHALLENGE_V2, PROTECTED_SCOPE, { connection });
+      await host.brokerAccept(BRIDGE_BIND_V2, PROTECTED_FRAME, { connection });
+      await host.brokerAccept(BRIDGE_RELAY_INGRESS,
+        { model: 'probe', prompt_sha256: `sha256:${'a'.repeat(64)}` }, { connection });
+      await assert.rejects(host.brokerAccept(BRIDGE_RELAY_COMPLETE,
+        { request_sha256: `sha256:${'b'.repeat(64)}` }, { connection }), code('caller_mismatch'));
+      assert.equal(log.some(([kind]) => kind === 'relay_complete'), false);
+    } finally {
+      await host.stop();
+    }
+  }
 });
 
 test('B relay ingress delegates opaque frames only over a live v2 bridge binding', async () => {

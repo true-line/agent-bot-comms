@@ -21,11 +21,14 @@ import (
 )
 
 const (
-	bindContext    = "agent-bot-stage2a-bridge-bind-v2"
-	relayIngressOp = "bridge.relay.ingress.v1"
-	ioTimeout      = 5 * time.Second
+	bindContext       = "agent-bot-stage2a-bridge-bind-v2"
+	relayIngressOp    = "bridge.relay.ingress.v1"
+	relayCompletionOp = "bridge.relay.complete.v1"
+	ioTimeout         = 5 * time.Second
 	// HQ may perform a lease check, authorize the turn, and recheck the lease.
 	relayIngressTimeout = 20 * time.Second
+	// HQ rechecks live A, then waits for Machine's signed positive receipt.
+	relayCompletionTimeout = 20 * time.Second
 )
 
 var (
@@ -156,6 +159,19 @@ type brokerReply struct {
 	Result json.RawMessage `json:"result"`
 }
 
+type completionPayload struct {
+	Selectors          selectors `json:"selectors"`
+	BindReceiptSHA256  string    `json:"bind_receipt_sha256"`
+	RequestSHA256      string    `json:"request_sha256"`
+	PromptSHA256       string    `json:"prompt_sha256"`
+	Model              string    `json:"model"`
+	ResponseWireSHA256 string    `json:"response_wire_sha256"`
+	ResponseWireBytes  int       `json:"response_wire_bytes"`
+	HTTPStatus         int       `json:"http_status"`
+	WriteStartedAt     time.Time `json:"write_started_at"`
+	WriteCompletedAt   time.Time `json:"write_completed_at"`
+}
+
 type broker struct {
 	conn    *net.UnixConn
 	frames  chan []byte
@@ -215,8 +231,11 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 		return invalid
 	}
 	timeout := ioTimeout
-	if op == relayIngressOp {
+	switch op {
+	case relayIngressOp:
 		timeout = relayIngressTimeout
+	case relayCompletionOp:
+		timeout = relayCompletionTimeout
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -345,7 +364,7 @@ func run(ctx context.Context, config assignment, key []byte, status io.WriteClos
 			continue
 		}
 		stopConn := context.AfterFunc(ctx, func() { conn.Close() })
-		err = serve(ctx, conn, b, config, relay, &attempted)
+		err = serve(ctx, conn, b, config, relay, receipt, &attempted)
 		stopConn()
 		conn.Close()
 		if err != nil {

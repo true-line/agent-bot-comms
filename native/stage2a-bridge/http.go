@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 const maxBody = 256 << 10
@@ -72,37 +75,72 @@ func objectFields(data []byte, allowed ...string) map[string]json.RawMessage {
 	return result
 }
 
+// requestFields recognizes the first streaming Messages shape from stock
+// Claude ACP v0.109.0 on macOS and the existing eleven-field shape. The
+// assignment digest distinguishes particular requests in either shape.
+func requestFields(data []byte) (map[string]json.RawMessage, []string) {
+	request := objectFields(data, "context_management", "max_tokens", "messages", "metadata", "model",
+		"output_config", "safeguards", "stream", "system", "thinking", "tools")
+	switch {
+	case len(request) == 9 && request["output_config"] == nil && request["safeguards"] == nil:
+		return request, []string{"user"}
+	case len(request) == 11:
+		return request, []string{"user", "system"}
+	default:
+		return nil, nil
+	}
+}
+
 // normalizedRequest removes the only observed volatile stock-client field.
 // It validates every JSON object for duplicate keys, then serializes the
 // original raw values with metadata set to {}. All remaining body bytes are
 // committed by the Machine-signed request_sha256 in the B assignment.
-// Neither the raw body nor user_id is sent to HQ or the provider.
-func normalizedRequest(data []byte, config assignment) (string, error) {
-	fields := objectFields(data, "context_management", "max_tokens", "messages", "metadata", "model",
-		"output_config", "safeguards", "stream", "system", "thinking", "tools")
-	if len(fields) != 11 {
-		return "", invalid
+// The separate prompt digest binds the one parsed user text block without
+// sending its bytes to HQ. Neither the raw body nor user_id leaves B.
+func normalizedRequest(data []byte, config assignment) (string, string, error) {
+	fields, roles := requestFields(data)
+	if fields == nil {
+		return "", "", invalid
 	}
 	var model string
 	var stream bool
 	var messages []json.RawMessage
 	if json.Unmarshal(fields["model"], &model) != nil || model != config.Model ||
 		json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
-		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != 2 {
-		return "", invalid
+		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != len(roles) {
+		return "", "", invalid
 	}
-	for index, expected := range []string{"user", "system"} {
-		message := objectFields(messages[index], "role", "content", "output_config")
+	var promptSHA256 string
+	for index, expected := range roles {
+		allowed := []string{"role", "content"}
+		if index == 1 {
+			allowed = append(allowed, "output_config")
+		}
+		message := objectFields(messages[index], allowed...)
 		var role string
 		if message == nil || json.Unmarshal(message["role"], &role) != nil || role != expected ||
-			(index == 0 && len(message) != 2) || (index == 1 && len(message) != 3) {
-			return "", invalid
+			len(message) != len(allowed) {
+			return "", "", invalid
+		}
+		if expected == "user" {
+			var blocks []json.RawMessage
+			if json.Unmarshal(message["content"], &blocks) != nil || len(blocks) != 1 {
+				return "", "", invalid
+			}
+			block := objectFields(blocks[0], "type", "text")
+			var kind, prompt string
+			if len(block) != 2 || json.Unmarshal(block["type"], &kind) != nil || kind != "text" ||
+				json.Unmarshal(block["text"], &prompt) != nil || prompt == "" ||
+				!utf8.ValidString(prompt) || strings.ContainsRune(prompt, utf8.RuneError) {
+				return "", "", invalid
+			}
+			promptSHA256 = digest([]byte(prompt))
 		}
 	}
 	metadata := objectFields(fields["metadata"], "user_id")
 	var userID string
 	if len(metadata) != 1 || json.Unmarshal(metadata["user_id"], &userID) != nil || len(userID) > 1024 {
-		return "", invalid
+		return "", "", invalid
 	}
 	var identity struct {
 		Account string `json:"account_uuid"`
@@ -111,7 +149,7 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	}
 	if decode([]byte(userID), &identity) != nil || (identity.Account != "" && !uuidPattern.MatchString(identity.Account)) ||
 		!hexPattern.MatchString(identity.Device) || !uuidPattern.MatchString(identity.Session) {
-		return "", invalid
+		return "", "", invalid
 	}
 	fields["metadata"] = json.RawMessage(`{}`)
 	// encoding/json sorts object keys and compacts RawMessage values. This
@@ -119,9 +157,9 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	// independent signer pins its digest, never a client-supplied digest.
 	normalized, err := json.Marshal(fields)
 	if err != nil || digest(normalized) != config.RequestDigest {
-		return "", invalid
+		return "", "", invalid
 	}
-	return config.RequestDigest, nil
+	return config.RequestDigest, promptSHA256, nil
 }
 
 // approvedHeaders commits every nonvolatile header, including the API version,
@@ -163,13 +201,32 @@ func approvedHeaders(req *http.Request, config assignment) bool {
 	return digest([]byte(canonical.String())) == config.HeadersDigest
 }
 
-func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) {
-	if conn.SetWriteDeadline(deadline()) != nil {
-		return
-	}
-	fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+type httpWrite struct {
+	SHA256      string
+	Bytes       int
+	Status      int
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) (httpWrite, error) {
+	var response bytes.Buffer
+	fmt.Fprintf(&response, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
 		status, http.StatusText(status), contentType, len(data))
-	conn.Write(data)
+	response.Write(data)
+	if conn.SetWriteDeadline(deadline()) != nil {
+		return httpWrite{}, invalid
+	}
+	wire := response.Bytes()
+	started := time.Now().UTC()
+	for written := 0; written < len(wire); {
+		n, err := conn.Write(wire[written:])
+		written += n
+		if err != nil || n == 0 {
+			return httpWrite{}, invalid
+		}
+	}
+	return httpWrite{digest(wire), len(wire), status, started, time.Now().UTC()}, nil
 }
 
 type qualificationResult struct {
@@ -206,7 +263,7 @@ func (r qualificationResult) eventStream() []byte {
 	return out.Bytes()
 }
 
-func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, attempted *bool) error {
+func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, bindReceipt string, attempted *bool) error {
 	if conn.SetReadDeadline(deadline()) != nil {
 		return nil
 	}
@@ -243,7 +300,7 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
 	}
-	requestDigest, err := normalizedRequest(data, config)
+	requestDigest, promptDigest, err := normalizedRequest(data, config)
 	if err != nil {
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
@@ -262,6 +319,23 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid
 	}
-	writeHTTP(conn, 200, "text/event-stream", result.eventStream())
+	written, err := writeHTTP(conn, 200, "text/event-stream", result.eventStream())
+	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+		return errors.New("response write or endpoint verification failed")
+	}
+	var ack struct {
+		Accepted bool `json:"accepted"`
+	}
+	completion := completionPayload{
+		Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
+		RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
+		ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
+		HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
+		WriteCompletedAt: written.CompletedAt,
+	}
+	if b.call(ctx, "complete", relayCompletionOp, completion, &ack) != nil || !ack.Accepted ||
+		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+		return errors.New("broker completion rejected")
+	}
 	return nil
 }
