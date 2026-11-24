@@ -263,7 +263,54 @@ func (r qualificationResult) eventStream() []byte {
 	return out.Bytes()
 }
 
-func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, bindReceipt string, attempted *bool) error {
+func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint,
+	bindReceipt string, peer peerProcessSnapshot, capture capturePeer, attempted *bool) error {
+	currentPeer := func() bool {
+		if capture == nil {
+			return false
+		}
+		current, err := capture(conn)
+		return err == nil && current == peer && validRelayPeer(current, config.RunnerUID)
+	}
+	peerValue := cooperativePeerValue(peer)
+	peerBytes, err := json.Marshal(peerValue)
+	if err != nil {
+		return invalid
+	}
+	peerSHA256 := digest(peerBytes)
+	return serveWithIngress(ctx, conn, config, relay, attempted, func(model, promptSHA string,
+		out *qualificationResult) error {
+		return b.call(ctx, "ingress", relayIngressOp,
+			struct {
+				Model        string         `json:"model"`
+				PromptDigest string         `json:"prompt_sha256"`
+				Peer         map[string]any `json:"peer"`
+			}{model, promptSHA, peerValue}, out)
+	}, currentPeer, func(requestDigest, promptDigest string, written httpWrite) error {
+		var ack struct {
+			Accepted bool `json:"accepted"`
+		}
+		completion := completionPayload{
+			Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
+			Peer: peerValue, PeerSHA256: peerSHA256,
+			RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
+			ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
+			HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
+			WriteCompletedAt: written.CompletedAt,
+		}
+		if b.call(ctx, "complete", relayCompletionOp, completion, &ack) != nil || !ack.Accepted {
+			return errors.New("broker completion rejected")
+		}
+		return nil
+	})
+}
+
+func serveWithIngress(ctx context.Context, conn *net.UnixConn, config assignment,
+	relay endpoint, attempted *bool, authorize func(string, string, *qualificationResult) error,
+	currentPeer func() bool, complete func(string, string, httpWrite) error) error {
+	if authorize == nil || currentPeer == nil || !currentPeer() {
+		return invalid
+	}
 	if conn.SetReadDeadline(deadline()) != nil {
 		return nil
 	}
@@ -305,37 +352,25 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
 	}
-	if ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+	if ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
 		return invalid
 	}
 	*attempted = true
-	payload := struct {
-		Model        string `json:"model"`
-		PromptDigest string `json:"prompt_sha256"`
-	}{config.Model, requestDigest}
 	var result qualificationResult
-	if b.call(ctx, "ingress", relayIngressOp, payload, &result) != nil || !result.valid(config.Model) ||
-		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+	if authorize(config.Model, requestDigest, &result) != nil || !result.valid(config.Model) ||
+		ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid
 	}
 	written, err := writeHTTP(conn, 200, "text/event-stream", result.eventStream())
-	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
 		return errors.New("response write or endpoint verification failed")
 	}
-	var ack struct {
-		Accepted bool `json:"accepted"`
-	}
-	completion := completionPayload{
-		Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
-		RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
-		ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
-		HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
-		WriteCompletedAt: written.CompletedAt,
-	}
-	if b.call(ctx, "complete", relayCompletionOp, completion, &ack) != nil || !ack.Accepted ||
-		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
-		return errors.New("broker completion rejected")
+	if complete != nil {
+		if complete(requestDigest, promptDigest, written) != nil ||
+			ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
+			return errors.New("broker completion rejected")
+		}
 	}
 	return nil
 }

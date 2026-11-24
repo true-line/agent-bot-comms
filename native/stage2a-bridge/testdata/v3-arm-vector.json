@@ -1,0 +1,44 @@
+{
+  "members": [
+    {
+      "bridge_arm": {
+        "adapter_gid": 331,
+        "adapter_pid": 4101,
+        "adapter_start_micros": 100,
+        "adapter_start_seconds": 1795356918,
+        "adapter_uid": 331,
+        "armed_at": "2026-11-22T14:15:20Z",
+        "bridge_uid": 333,
+        "child_observation_envelope_sha256": "sha256:b94f6f09ea2d68f0ade0a4bd3cf48782f459456cbac1476811a440a9b338faf6",
+        "member_id": "m_lead",
+        "member_selector": "mb_b5c91675d3e898c3130737e8b182afcf8e0fe49af27f62b150ab6ae4fb97311a",
+        "provider_ingress": "withheld-pending-per-peer-attestation",
+        "relay_peer_rule": "a-attested-live-direct-child-of-adapter-v1",
+        "relay_peer_state": "unobserved",
+        "runtime_id": "runtime_fixture_m_lead",
+        "state": "armed"
+      },
+      "bridge_arm_receipt_sha256": "sha256:86174dfdf16755301def73b9b4dd70728b6e5661ad49d99b6b189c6a06b846c1"
+    },
+    {
+      "bridge_arm": {
+        "adapter_gid": 331,
+        "adapter_pid": 4102,
+        "adapter_start_micros": 101,
+        "adapter_start_seconds": 1795356918,
+        "adapter_uid": 331,
+        "armed_at": "2026-11-22T14:15:20Z",
+        "bridge_uid": 333,
+        "child_observation_envelope_sha256": "sha256:b94f6f09ea2d68f0ade0a4bd3cf48782f459456cbac1476811a440a9b338faf6",
+        "member_id": "m_spec",
+        "member_selector": "mb_fd87fbfbc1a19e41890485e6ba557c03c1649ddf18982f283796f2bb253ba688",
+        "provider_ingress": "withheld-pending-per-peer-attestation",
+        "relay_peer_rule": "a-attested-live-direct-child-of-adapter-v1",
+        "relay_peer_state": "unobserved",
+        "runtime_id": "runtime_fixture_m_spec",
+        "state": "armed"
+      },
+      "bridge_arm_receipt_sha256": "sha256:90e596cc8396a8a037d96094063eeac9822a775651cb72c1cf10e605fb80ab0a"
+    }
+  ]
+}
