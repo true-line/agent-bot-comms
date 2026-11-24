@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const maxBody = 256 << 10
@@ -94,11 +95,12 @@ func requestFields(data []byte) (map[string]json.RawMessage, []string) {
 // It validates every JSON object for duplicate keys, then serializes the
 // original raw values with metadata set to {}. All remaining body bytes are
 // committed by the Machine-signed request_sha256 in the B assignment.
-// Neither the raw body nor user_id is sent to HQ or the provider.
-func normalizedRequest(data []byte, config assignment) (string, error) {
+// The separate prompt digest binds the one parsed user text block without
+// sending its bytes to HQ. Neither the raw body nor user_id leaves B.
+func normalizedRequest(data []byte, config assignment) (string, string, error) {
 	fields, roles := requestFields(data)
 	if fields == nil {
-		return "", invalid
+		return "", "", invalid
 	}
 	var model string
 	var stream bool
@@ -106,8 +108,9 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	if json.Unmarshal(fields["model"], &model) != nil || model != config.Model ||
 		json.Unmarshal(fields["stream"], &stream) != nil || !stream ||
 		json.Unmarshal(fields["messages"], &messages) != nil || len(messages) != len(roles) {
-		return "", invalid
+		return "", "", invalid
 	}
+	var promptSHA256 string
 	for index, expected := range roles {
 		allowed := []string{"role", "content"}
 		if index == 1 {
@@ -117,13 +120,27 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 		var role string
 		if message == nil || json.Unmarshal(message["role"], &role) != nil || role != expected ||
 			len(message) != len(allowed) {
-			return "", invalid
+			return "", "", invalid
+		}
+		if expected == "user" {
+			var blocks []json.RawMessage
+			if json.Unmarshal(message["content"], &blocks) != nil || len(blocks) != 1 {
+				return "", "", invalid
+			}
+			block := objectFields(blocks[0], "type", "text")
+			var kind, prompt string
+			if len(block) != 2 || json.Unmarshal(block["type"], &kind) != nil || kind != "text" ||
+				json.Unmarshal(block["text"], &prompt) != nil || prompt == "" ||
+				!utf8.ValidString(prompt) || strings.ContainsRune(prompt, utf8.RuneError) {
+				return "", "", invalid
+			}
+			promptSHA256 = digest([]byte(prompt))
 		}
 	}
 	metadata := objectFields(fields["metadata"], "user_id")
 	var userID string
 	if len(metadata) != 1 || json.Unmarshal(metadata["user_id"], &userID) != nil || len(userID) > 1024 {
-		return "", invalid
+		return "", "", invalid
 	}
 	var identity struct {
 		Account string `json:"account_uuid"`
@@ -132,7 +149,7 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	}
 	if decode([]byte(userID), &identity) != nil || (identity.Account != "" && !uuidPattern.MatchString(identity.Account)) ||
 		!hexPattern.MatchString(identity.Device) || !uuidPattern.MatchString(identity.Session) {
-		return "", invalid
+		return "", "", invalid
 	}
 	fields["metadata"] = json.RawMessage(`{}`)
 	// encoding/json sorts object keys and compacts RawMessage values. This
@@ -140,9 +157,9 @@ func normalizedRequest(data []byte, config assignment) (string, error) {
 	// independent signer pins its digest, never a client-supplied digest.
 	normalized, err := json.Marshal(fields)
 	if err != nil || digest(normalized) != config.RequestDigest {
-		return "", invalid
+		return "", "", invalid
 	}
-	return config.RequestDigest, nil
+	return config.RequestDigest, promptSHA256, nil
 }
 
 // approvedHeaders commits every nonvolatile header, including the API version,
@@ -283,7 +300,7 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
 	}
-	requestDigest, err := normalizedRequest(data, config)
+	requestDigest, promptDigest, err := normalizedRequest(data, config)
 	if err != nil {
 		writeHTTP(conn, 422, "text/plain", nil)
 		return nil
@@ -311,7 +328,7 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 	}
 	completion := completionPayload{
 		Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
-		RequestSHA256: requestDigest, Model: config.Model,
+		RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
 		ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
 		HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
 		WriteCompletedAt: written.CompletedAt,

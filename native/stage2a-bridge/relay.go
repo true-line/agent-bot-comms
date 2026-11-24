@@ -161,6 +161,7 @@ type completionPayload struct {
 	Selectors          selectors `json:"selectors"`
 	BindReceiptSHA256  string    `json:"bind_receipt_sha256"`
 	RequestSHA256      string    `json:"request_sha256"`
+	PromptSHA256       string    `json:"prompt_sha256"`
 	Model              string    `json:"model"`
 	ResponseWireSHA256 string    `json:"response_wire_sha256"`
 	ResponseWireBytes  int       `json:"response_wire_bytes"`

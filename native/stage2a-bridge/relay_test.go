@@ -120,7 +120,8 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				if err != nil || json.Unmarshal(encoded, &completion) != nil ||
 					completion.Selectors != cfg.Selectors ||
 					completion.BindReceiptSHA256 != digest([]byte(strings.Repeat("1", 64))) ||
-					completion.RequestSHA256 != cfg.RequestDigest || completion.Model != cfg.Model ||
+					completion.RequestSHA256 != cfg.RequestDigest ||
+					completion.PromptSHA256 != digest([]byte("exact prompt")) || completion.Model != cfg.Model ||
 					completion.HTTPStatus != http.StatusOK || completion.ResponseWireBytes <= 0 ||
 					!validDigest(completion.ResponseWireSHA256) || completion.WriteStartedAt.IsZero() ||
 					completion.WriteCompletedAt.Before(completion.WriteStartedAt) {
@@ -224,6 +225,30 @@ func (f *fixture) rawHTTP(t *testing.T, body string) []byte {
 }
 
 var prompt = `{"context_management":{},"max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"exact prompt"}]},{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}],"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"` + strings.Repeat("a", 64) + `\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"},"model":"probe","output_config":{},"safeguards":{},"stream":true,"system":[],"thinking":{},"tools":[]}`
+
+func TestAmbiguousUserContentRejectedEvenWithMatchingAssignmentDigest(t *testing.T) {
+	for name, content := range map[string]string{
+		"two_text_blocks": `[{"type":"text","text":"exact prompt"},{"type":"text","text":"another"}]`,
+		"tool_block":      `[{"type":"tool_use","id":"tool_1","name":"Read","input":{}}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Replace(prompt, `[{"type":"text","text":"exact prompt"}]`, content, 1)
+			fields, _ := requestFields([]byte(body))
+			if fields == nil {
+				t.Fatal("test request shape changed")
+			}
+			fields["metadata"] = json.RawMessage(`{}`)
+			normalized, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := assignment{Model: "probe", RequestDigest: digest(normalized)}
+			if _, _, err := normalizedRequest([]byte(body), cfg); err == nil {
+				t.Fatal("ambiguous content passed with its own signed request digest")
+			}
+		})
+	}
+}
 
 func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) {
 	f := newFixture(t, false, 0, prompt)
@@ -329,7 +354,8 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 	}
 	completion := <-f.completed
 	if completion.ResponseWireSHA256 != digest(wire) || completion.ResponseWireBytes != len(wire) ||
-		completion.HTTPStatus != http.StatusOK {
+		completion.HTTPStatus != http.StatusOK || completion.PromptSHA256 != digest([]byte("exact prompt")) ||
+		completion.PromptSHA256 == completion.RequestSHA256 {
 		t.Fatalf("completion does not bind exact client wire: %+v", completion)
 	}
 	if status, _ := f.http(t, stock); status != 409 {
