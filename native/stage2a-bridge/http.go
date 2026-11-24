@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const maxBody = 256 << 10
@@ -182,13 +184,32 @@ func approvedHeaders(req *http.Request, config assignment) bool {
 	return digest([]byte(canonical.String())) == config.HeadersDigest
 }
 
-func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) {
-	if conn.SetWriteDeadline(deadline()) != nil {
-		return
-	}
-	fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+type httpWrite struct {
+	SHA256      string
+	Bytes       int
+	Status      int
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) (httpWrite, error) {
+	var response bytes.Buffer
+	fmt.Fprintf(&response, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
 		status, http.StatusText(status), contentType, len(data))
-	conn.Write(data)
+	response.Write(data)
+	if conn.SetWriteDeadline(deadline()) != nil {
+		return httpWrite{}, invalid
+	}
+	wire := response.Bytes()
+	started := time.Now().UTC()
+	for written := 0; written < len(wire); {
+		n, err := conn.Write(wire[written:])
+		written += n
+		if err != nil || n == 0 {
+			return httpWrite{}, invalid
+		}
+	}
+	return httpWrite{digest(wire), len(wire), status, started, time.Now().UTC()}, nil
 }
 
 type qualificationResult struct {
@@ -225,7 +246,7 @@ func (r qualificationResult) eventStream() []byte {
 	return out.Bytes()
 }
 
-func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, attempted *bool) error {
+func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint, bindReceipt string, attempted *bool) error {
 	if conn.SetReadDeadline(deadline()) != nil {
 		return nil
 	}
@@ -281,6 +302,23 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid
 	}
-	writeHTTP(conn, 200, "text/event-stream", result.eventStream())
+	written, err := writeHTTP(conn, 200, "text/event-stream", result.eventStream())
+	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+		return errors.New("response write or endpoint verification failed")
+	}
+	var ack struct {
+		Accepted bool `json:"accepted"`
+	}
+	completion := completionPayload{
+		Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
+		RequestSHA256: requestDigest, Model: config.Model,
+		ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
+		HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
+		WriteCompletedAt: written.CompletedAt,
+	}
+	if b.call(ctx, "complete", relayCompletionOp, completion, &ack) != nil || !ack.Accepted ||
+		ctx.Err() != nil || !relay.current() || !config.Broker.current() {
+		return errors.New("broker completion rejected")
+	}
 	return nil
 }

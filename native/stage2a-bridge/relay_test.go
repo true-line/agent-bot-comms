@@ -21,12 +21,14 @@ import (
 )
 
 type fixture struct {
-	config   assignment
-	status   chan string
-	peer     atomic.Uint32
-	requests chan string
-	done     chan error
-	drop     chan struct{}
+	config           assignment
+	status           chan string
+	peer             atomic.Uint32
+	requests         chan string
+	completed        chan completionPayload
+	rejectCompletion atomic.Bool
+	done             chan error
+	drop             chan struct{}
 }
 
 type statusWriter struct{ status chan string }
@@ -41,7 +43,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	f := &fixture{status: make(chan string, 1), requests: make(chan string, 4), done: make(chan error, 1), drop: make(chan struct{})}
+	f := &fixture{status: make(chan string, 1), requests: make(chan string, 4), completed: make(chan completionPayload, 1), done: make(chan error, 1), drop: make(chan struct{})}
 	f.peer.Store(321)
 	brokerDir, relayDir := filepath.Join(dir, "broker"), filepath.Join(dir, "relay")
 	if os.Mkdir(brokerDir, 0750) != nil || os.Mkdir(relayDir, 0750) != nil {
@@ -112,6 +114,20 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				}
 				result = map[string]any{"model": cfg.Model, "text": "fixture response", "stop_reason": "end_turn",
 					"usage": map[string]int{"input_tokens": 1, "output_tokens": 2}}
+			case relayCompletionOp:
+				encoded, err := json.Marshal(req.Payload)
+				var completion completionPayload
+				if err != nil || json.Unmarshal(encoded, &completion) != nil ||
+					completion.Selectors != cfg.Selectors ||
+					completion.BindReceiptSHA256 != digest([]byte(strings.Repeat("1", 64))) ||
+					completion.RequestSHA256 != cfg.RequestDigest || completion.Model != cfg.Model ||
+					completion.HTTPStatus != http.StatusOK || completion.ResponseWireBytes <= 0 ||
+					!validDigest(completion.ResponseWireSHA256) || completion.WriteStartedAt.IsZero() ||
+					completion.WriteCompletedAt.Before(completion.WriteStartedAt) {
+					return
+				}
+				f.completed <- completion
+				result = map[string]bool{"accepted": !f.rejectCompletion.Load()}
 			default:
 				return
 			}
@@ -191,6 +207,22 @@ func (f *fixture) httpWith(t *testing.T, body, extraHeaders, query string) (int,
 	return response.StatusCode, string(data)
 }
 
+func (f *fixture) rawHTTP(t *testing.T, body string) []byte {
+	t.Helper()
+	conn, err := net.Dial("unix", f.config.Relay.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(relayIngressTimeout + 2*ioTimeout))
+	fmt.Fprintf(conn, "POST /v1/messages?beta=true HTTP/1.1\r\nHost: unix\r\nAccept: application/json\r\nAnthropic-Beta: fixture-beta\r\nAnthropic-Dangerous-Direct-Browser-Access: true\r\nAnthropic-Version: 2023-06-01\r\nContent-Type: application/json\r\nX-App: cli\r\nX-Stainless-Retry-Count: 0\r\nX-Api-Key: fixture-key\r\nX-Claude-Code-Session-Id: 11111111-1111-1111-1111-111111111111\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	wire, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
 var prompt = `{"context_management":{},"max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"exact prompt"}]},{"role":"system","content":[{"type":"text","text":"system"}],"output_config":{}}],"metadata":{"user_id":"{\"account_uuid\":\"\",\"device_id\":\"` + strings.Repeat("a", 64) + `\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}"},"model":"probe","output_config":{},"safeguards":{},"stream":true,"system":[],"thinking":{},"tools":[]}`
 
 func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) {
@@ -254,7 +286,7 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) 
 	if status, _ := f.http(t, prompt); status != 409 {
 		t.Fatalf("replay returned %d", status)
 	}
-	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", "bridge.relay.ingress.v1"} {
+	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
 		if got := <-f.requests; got != op {
 			t.Fatalf("op %s != %s", got, op)
 		}
@@ -286,13 +318,24 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 			t.Errorf("%s got %d, want 422", name, status)
 		}
 	}
-	if status, body := f.http(t, stock); status != 200 || !strings.Contains(body, "event: message_stop") {
-		t.Fatalf("stock request got %d %s", status, body)
+	select {
+	case completion := <-f.completed:
+		t.Fatalf("rejected request produced completion: %+v", completion)
+	default:
+	}
+	wire := f.rawHTTP(t, stock)
+	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") || !strings.Contains(string(wire), "event: message_stop") {
+		t.Fatalf("stock request got unexpected wire %s", wire)
+	}
+	completion := <-f.completed
+	if completion.ResponseWireSHA256 != digest(wire) || completion.ResponseWireBytes != len(wire) ||
+		completion.HTTPStatus != http.StatusOK {
+		t.Fatalf("completion does not bind exact client wire: %+v", completion)
 	}
 	if status, _ := f.http(t, stock); status != 409 {
 		t.Fatalf("stock replay got %d, want 409", status)
 	}
-	for _, expected := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp} {
+	for _, expected := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
 		if got := <-f.requests; got != expected {
 			t.Fatalf("broker operation %s, want %s", got, expected)
 		}
@@ -300,6 +343,61 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 	select {
 	case op := <-f.requests:
 		t.Fatalf("unexpected extra broker operation: %s", op)
+	default:
+	}
+}
+
+func TestFailedHTTPWriteProducesNoCompletionEvidence(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "b-write-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "response.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := server.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	written, err := writeHTTP(server, http.StatusOK, "text/event-stream", []byte("event: message_stop\n\n"))
+	if err == nil || written != (httpWrite{}) {
+		t.Fatalf("failed write claimed completed wire: %+v, %v", written, err)
+	}
+}
+
+func TestCompletionRefusalStopsRelayAfterOneWrite(t *testing.T) {
+	f := newFixture(t, false, 0, prompt)
+	f.rejectCompletion.Store(true)
+	f.ready(t)
+	wire := f.rawHTTP(t, prompt)
+	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") {
+		t.Fatalf("response was not written before completion: %s", wire)
+	}
+	f.stopped(t, "broker completion rejected")
+	if _, err := os.Lstat(f.config.Relay.Path); !os.IsNotExist(err) {
+		t.Fatalf("relay remained after rejected completion: %v", err)
+	}
+	for _, want := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
+		if got := <-f.requests; got != want {
+			t.Fatalf("operation %s, want %s", got, want)
+		}
+	}
+	select {
+	case op := <-f.requests:
+		t.Fatalf("rejected completion retried: %s", op)
 	default:
 	}
 }
