@@ -23,10 +23,12 @@ import (
 
 type fixture struct {
 	config           assignment
+	rawKey           []byte
 	status           chan string
 	peer             atomic.Uint32
 	peerStart        atomic.Uint64
 	requests         chan string
+	prewritten       chan prewritePayload
 	completed        chan completionPayload
 	rejectCompletion atomic.Bool
 	completionDelay  atomic.Int64
@@ -58,13 +60,20 @@ func sameFixturePeer(got any, expected peerProcessSnapshot) bool {
 }
 
 func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBody string) *fixture {
+	return newFixtureWithWriter(t, stale, providerDelay, requestBody, writePreparedHTTP)
+}
+
+func newFixtureWithWriter(t *testing.T, stale bool, providerDelay time.Duration, requestBody string,
+	writer func(*net.UnixConn, preparedHTTP) (httpWrite, error)) *fixture {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "b-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	f := &fixture{status: make(chan string, 1), requests: make(chan string, 4), completed: make(chan completionPayload, 1), done: make(chan error, 1), drop: make(chan struct{})}
+	f := &fixture{status: make(chan string, 1), requests: make(chan string, 8),
+		prewritten: make(chan prewritePayload, 1), completed: make(chan completionPayload, 1),
+		done: make(chan error, 1), drop: make(chan struct{})}
 	f.peer.Store(321)
 	f.peerStart.Store(100)
 	expectedPeer := f.peerSnapshot()
@@ -93,6 +102,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 	cfg.Relay.Parent, _ = observe(relayDir, os.ModeDir)
 	cfg.Relay.Socket = identity{UID: cfg.Relay.Parent.UID, GID: cfg.Relay.Parent.GID, Mode: 0660}
 	key := []byte(strings.Repeat("k", 32))
+	f.rawKey = key
 	go func() {
 		conn, err := l.AcceptUnix()
 		if err != nil {
@@ -102,6 +112,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 		go func() { <-f.drop; conn.Close() }()
 		scanner := bufio.NewScanner(conn)
 		encoder := json.NewEncoder(conn)
+		var prewrite prewritePayload
 		for scanner.Scan() {
 			var req struct {
 				ID      string         `json:"id"`
@@ -139,6 +150,22 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				}
 				result = map[string]any{"model": cfg.Model, "text": "fixture response", "stop_reason": "end_turn",
 					"usage": map[string]int{"input_tokens": 1, "output_tokens": 2}}
+			case relayPrewriteOp:
+				encoded, err := json.Marshal(req.Payload)
+				peerBytes, _ := json.Marshal(cooperativePeerValue(expectedPeer))
+				if err != nil || len(req.Payload) != 10 || json.Unmarshal(encoded, &prewrite) != nil ||
+					prewrite.Selectors != cfg.Selectors ||
+					prewrite.BindReceiptSHA256 != digest([]byte(strings.Repeat("1", 64))) ||
+					!sameFixturePeer(prewrite.Peer, expectedPeer) ||
+					prewrite.PeerSHA256 != digest(peerBytes) ||
+					prewrite.RequestSHA256 != cfg.RequestDigest ||
+					prewrite.PromptSHA256 != digest([]byte("exact prompt")) ||
+					prewrite.Model != cfg.Model || !validDigest(prewrite.ResponseWireSHA256) ||
+					prewrite.ResponseWireBytes <= 0 || prewrite.HTTPStatus != http.StatusOK {
+					return
+				}
+				f.prewritten <- prewrite
+				result = map[string]any{"accepted": true, "prewrite_receipt": strings.Repeat("3", 64)}
 			case relayCompletionOp:
 				encoded, err := json.Marshal(req.Payload)
 				var completion completionPayload
@@ -146,12 +173,17 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 				if err != nil || json.Unmarshal(encoded, &completion) != nil ||
 					completion.Selectors != cfg.Selectors ||
 					completion.BindReceiptSHA256 != digest([]byte(strings.Repeat("1", 64))) ||
+					completion.PrewriteReceipt != strings.Repeat("3", 64) ||
 					!sameFixturePeer(completion.Peer, expectedPeer) ||
 					completion.PeerSHA256 != digest(peerBytes) ||
 					completion.RequestSHA256 != cfg.RequestDigest ||
 					completion.PromptSHA256 != digest([]byte("exact prompt")) || completion.Model != cfg.Model ||
 					completion.HTTPStatus != http.StatusOK || completion.ResponseWireBytes <= 0 ||
-					!validDigest(completion.ResponseWireSHA256) || completion.WriteStartedAt.IsZero() ||
+					completion.ResponseWireSHA256 != prewrite.ResponseWireSHA256 ||
+					completion.ResponseWireBytes != prewrite.ResponseWireBytes ||
+					completion.HTTPStatus != prewrite.HTTPStatus ||
+					!hexPattern.MatchString(completion.CompletionOriginMAC) ||
+					completion.WriteStartedAt.IsZero() ||
 					completion.WriteCompletedAt.Before(completion.WriteStartedAt) {
 					return
 				}
@@ -183,7 +215,7 @@ func newFixture(t *testing.T, stale bool, providerDelay time.Duration, requestBo
 			return f.peer.Load(), nil
 		}, func(*net.UnixConn) (peerProcessSnapshot, error) {
 			return f.peerSnapshot(), nil
-		})
+		}, writer)
 	}()
 	return f
 }
@@ -347,7 +379,8 @@ func TestRelayRejectsWrongPeerAndMalformedHTTPThenUsesIngressOnce(t *testing.T) 
 	if status, _ := f.http(t, prompt); status != 409 {
 		t.Fatalf("replay returned %d", status)
 	}
-	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
+	for _, op := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp,
+		relayPrewriteOp, relayCompletionOp} {
 		if got := <-f.requests; got != op {
 			t.Fatalf("op %s != %s", got, op)
 		}
@@ -368,6 +401,9 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 	stock = strings.Replace(stock, `"tools":[]`, `"tools":[{"name":"Read","input_schema":{"type":"object"}}]`, 1)
 	f := newFixture(t, false, 0, stock)
 	f.ready(t)
+	if !bytes.Equal(f.rawKey, make([]byte, 32)) {
+		t.Fatal("raw FD4 proof survived broker bind")
+	}
 	for name, body := range map[string]string{
 		"ancillary": strings.Replace(stock, `"context_management":{},`, `"output_config":{},`, 1),
 		"system":    strings.Replace(stock, "stock system instructions", "other instructions", 1),
@@ -388,17 +424,24 @@ func TestStockACPFirstMessagesRequestUsesIngressOnce(t *testing.T) {
 	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") || !strings.Contains(string(wire), "event: message_stop") {
 		t.Fatalf("stock request got unexpected wire %s", wire)
 	}
+	prewrite := <-f.prewritten
+	if prewrite.ResponseWireSHA256 != digest(wire) || prewrite.ResponseWireBytes != len(wire) ||
+		prewrite.HTTPStatus != http.StatusOK {
+		t.Fatalf("prewrite intent did not match the actual client wire: %+v", prewrite)
+	}
 	completion := <-f.completed
 	if completion.ResponseWireSHA256 != digest(wire) || completion.ResponseWireBytes != len(wire) ||
 		completion.HTTPStatus != http.StatusOK || completion.PromptSHA256 != digest([]byte("exact prompt")) ||
 		completion.PeerSHA256 != "sha256:ad8a2b08d26de9cb382b7a7f77f2670cdd91be7187f5dcbf563e0ba1118446f9" ||
+		!hexPattern.MatchString(completion.CompletionOriginMAC) ||
 		completion.PromptSHA256 == completion.RequestSHA256 {
 		t.Fatalf("completion does not bind exact client wire: %+v", completion)
 	}
 	if status, _ := f.http(t, stock); status != 409 {
 		t.Fatalf("stock replay got %d, want 409", status)
 	}
-	for _, expected := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
+	for _, expected := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp,
+		relayPrewriteOp, relayCompletionOp} {
 		if got := <-f.requests; got != expected {
 			t.Fatalf("broker operation %s, want %s", got, expected)
 		}
@@ -453,7 +496,8 @@ func TestCompletionRefusalStopsRelayAfterOneWrite(t *testing.T) {
 	if _, err := os.Lstat(f.config.Relay.Path); !os.IsNotExist(err) {
 		t.Fatalf("relay remained after rejected completion: %v", err)
 	}
-	for _, want := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp, relayCompletionOp} {
+	for _, want := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp,
+		relayPrewriteOp, relayCompletionOp} {
 		if got := <-f.requests; got != want {
 			t.Fatalf("operation %s, want %s", got, want)
 		}
@@ -461,6 +505,37 @@ func TestCompletionRefusalStopsRelayAfterOneWrite(t *testing.T) {
 	select {
 	case op := <-f.requests:
 		t.Fatalf("rejected completion retried: %s", op)
+	default:
+	}
+}
+
+func TestPartialResponseWriteNeverSendsCompletionOrOriginMAC(t *testing.T) {
+	f := newFixtureWithWriter(t, false, 0, prompt,
+		func(conn *net.UnixConn, prepared preparedHTTP) (httpWrite, error) {
+			if _, err := conn.Write(prepared.Wire[:1]); err != nil {
+				return httpWrite{}, err
+			}
+			return httpWrite{}, invalid
+		})
+	f.ready(t)
+	if wire := f.rawHTTP(t, prompt); len(wire) != 1 {
+		t.Fatalf("partial writer returned %d bytes, want one", len(wire))
+	}
+	if prewrite := <-f.prewritten; prewrite.ResponseWireBytes <= 1 {
+		t.Fatalf("prewrite did not hold a full response intent: %+v", prewrite)
+	}
+	f.stopped(t, "response write or endpoint verification failed")
+	for _, want := range []string{"bridge.bind.v2.challenge", "bridge.bind.v2", relayIngressOp,
+		relayPrewriteOp} {
+		if got := <-f.requests; got != want {
+			t.Fatalf("operation %s, want %s", got, want)
+		}
+	}
+	select {
+	case completion := <-f.completed:
+		t.Fatalf("partial write emitted authenticated completion: %+v", completion)
+	case op := <-f.requests:
+		t.Fatalf("partial write reached HQ as %s", op)
 	default:
 	}
 }
@@ -483,7 +558,7 @@ func TestCompletionWaitsForHQBeyondDefaultBrokerTimeout(t *testing.T) {
 	}
 }
 
-func TestChangedPeerBeforeHQCompletionRefusesPositiveRelay(t *testing.T) {
+func TestPeerExitAfterFullWireStillCompletes(t *testing.T) {
 	f := newFixture(t, false, 0, prompt)
 	f.completionDelay.Store(int64(500 * time.Millisecond))
 	f.ready(t)
@@ -492,14 +567,20 @@ func TestChangedPeerBeforeHQCompletionRefusesPositiveRelay(t *testing.T) {
 	if completion := <-f.completed; completion.PeerSHA256 == "" {
 		t.Fatal("completion omitted measured peer digest")
 	}
-	f.peerStart.Store(101)
+	// A stock one-shot client may exit as soon as it reads the final SSE byte.
+	// HQ's delayed acknowledgement must not require that CLI PID to remain live.
+	f.peerStart.Store(0)
 	wire := <-response
 	if !strings.HasPrefix(string(wire), "HTTP/1.1 200 OK\r\n") {
 		t.Fatalf("response was not written before completion: %s", wire)
 	}
-	f.stopped(t, "broker completion rejected")
-	if _, err := os.Lstat(f.config.Relay.Path); !os.IsNotExist(err) {
-		t.Fatalf("relay remained after peer changed: %v", err)
+	select {
+	case err := <-f.done:
+		t.Fatalf("post-wire client exit incorrectly revoked completion: %v", err)
+	case <-time.After(750 * time.Millisecond):
+	}
+	if _, err := os.Lstat(f.config.Relay.Path); err != nil {
+		t.Fatalf("relay disappeared after successful completion: %v", err)
 	}
 }
 

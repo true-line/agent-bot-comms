@@ -63,7 +63,7 @@ func (b *broker) serveCooperativePeer(ctx context.Context, conn *net.UnixConn,
 		}
 		return nil
 	}
-	return serveWithIngress(ctx, conn, config, relay, attempted, authorize, current, nil)
+	return serveWithIngress(ctx, conn, config, relay, attempted, authorize, current, nil, nil, writePreparedHTTP)
 }
 
 // H forwards this same-bound request to A. Neither H's reply nor the A

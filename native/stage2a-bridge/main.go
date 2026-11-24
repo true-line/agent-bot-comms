@@ -111,5 +111,5 @@ func entry() error {
 	if version == cooperativeStartVersion {
 		return runCooperative(ctx, cooperative, key, statusFile, peerUID)
 	}
-	return run(ctx, v2, key, statusFile, peerUID, observePeerProcess)
+	return run(ctx, v2, key, statusFile, peerUID, observePeerProcess, writePreparedHTTP)
 }

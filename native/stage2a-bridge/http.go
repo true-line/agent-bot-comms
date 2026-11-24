@@ -209,24 +209,39 @@ type httpWrite struct {
 	CompletedAt time.Time
 }
 
-func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) (httpWrite, error) {
+type preparedHTTP struct {
+	Wire   []byte
+	SHA256 string
+	Bytes  int
+	Status int
+}
+
+func prepareHTTP(status int, contentType string, data []byte) preparedHTTP {
 	var response bytes.Buffer
 	fmt.Fprintf(&response, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
 		status, http.StatusText(status), contentType, len(data))
 	response.Write(data)
+	wire := response.Bytes()
+	return preparedHTTP{Wire: wire, SHA256: digest(wire), Bytes: len(wire), Status: status}
+}
+
+func writePreparedHTTP(conn *net.UnixConn, prepared preparedHTTP) (httpWrite, error) {
 	if conn.SetWriteDeadline(deadline()) != nil {
 		return httpWrite{}, invalid
 	}
-	wire := response.Bytes()
 	started := time.Now().UTC()
-	for written := 0; written < len(wire); {
-		n, err := conn.Write(wire[written:])
+	for written := 0; written < len(prepared.Wire); {
+		n, err := conn.Write(prepared.Wire[written:])
 		written += n
 		if err != nil || n == 0 {
 			return httpWrite{}, invalid
 		}
 	}
-	return httpWrite{digest(wire), len(wire), status, started, time.Now().UTC()}, nil
+	return httpWrite{prepared.SHA256, prepared.Bytes, prepared.Status, started, time.Now().UTC()}, nil
+}
+
+func writeHTTP(conn *net.UnixConn, status int, contentType string, data []byte) (httpWrite, error) {
+	return writePreparedHTTP(conn, prepareHTTP(status, contentType, data))
 }
 
 type qualificationResult struct {
@@ -264,7 +279,8 @@ func (r qualificationResult) eventStream() []byte {
 }
 
 func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment, relay endpoint,
-	bindReceipt string, peer peerProcessSnapshot, capture capturePeer, attempted *bool) error {
+	bindReceipt string, peer peerProcessSnapshot, capture capturePeer, completionKey []byte,
+	attempted *bool, writeSuccess func(*net.UnixConn, preparedHTTP) (httpWrite, error)) error {
 	currentPeer := func() bool {
 		if capture == nil {
 			return false
@@ -286,29 +302,55 @@ func serve(ctx context.Context, conn *net.UnixConn, b *broker, config assignment
 				PromptDigest string         `json:"prompt_sha256"`
 				Peer         map[string]any `json:"peer"`
 			}{model, promptSHA, peerValue}, out)
-	}, currentPeer, func(requestDigest, promptDigest string, written httpWrite) error {
+	}, currentPeer, func(requestDigest, promptDigest string, prepared preparedHTTP) (string, error) {
+		var ack struct {
+			Accepted        bool   `json:"accepted"`
+			PrewriteReceipt string `json:"prewrite_receipt"`
+		}
+		prewrite := prewritePayload{
+			Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
+			RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
+			Peer: peerValue, PeerSHA256: peerSHA256,
+			ResponseWireSHA256: prepared.SHA256, ResponseWireBytes: prepared.Bytes,
+			HTTPStatus: prepared.Status,
+		}
+		if b.call(ctx, "prewrite", relayPrewriteOp, prewrite, &ack) != nil || !ack.Accepted ||
+			!hexPattern.MatchString(ack.PrewriteReceipt) {
+			return "", errors.New("broker prewrite rejected")
+		}
+		return ack.PrewriteReceipt, nil
+	}, func(requestDigest, promptDigest, prewriteReceipt string, written httpWrite) error {
 		var ack struct {
 			Accepted bool `json:"accepted"`
 		}
-		completion := completionPayload{
+		core := completionCore{
 			Selectors: config.Selectors, BindReceiptSHA256: bindReceipt,
-			Peer: peerValue, PeerSHA256: peerSHA256,
+			PrewriteReceipt: prewriteReceipt,
+			Peer:            peerValue, PeerSHA256: peerSHA256,
 			RequestSHA256: requestDigest, PromptSHA256: promptDigest, Model: config.Model,
 			ResponseWireSHA256: written.SHA256, ResponseWireBytes: written.Bytes,
 			HTTPStatus: written.Status, WriteStartedAt: written.StartedAt,
 			WriteCompletedAt: written.CompletedAt,
 		}
+		originMAC, err := completionOriginMAC(completionKey, core)
+		clear(completionKey)
+		if err != nil {
+			return errors.New("completion origin proof unavailable")
+		}
+		completion := completionPayload{completionCore: core, CompletionOriginMAC: originMAC}
 		if b.call(ctx, "complete", relayCompletionOp, completion, &ack) != nil || !ack.Accepted {
 			return errors.New("broker completion rejected")
 		}
 		return nil
-	})
+	}, writeSuccess)
 }
 
 func serveWithIngress(ctx context.Context, conn *net.UnixConn, config assignment,
 	relay endpoint, attempted *bool, authorize func(string, string, *qualificationResult) error,
-	currentPeer func() bool, complete func(string, string, httpWrite) error) error {
-	if authorize == nil || currentPeer == nil || !currentPeer() {
+	currentPeer func() bool, prewrite func(string, string, preparedHTTP) (string, error),
+	complete func(string, string, string, httpWrite) error,
+	writeSuccess func(*net.UnixConn, preparedHTTP) (httpWrite, error)) error {
+	if authorize == nil || currentPeer == nil || writeSuccess == nil || !currentPeer() {
 		return invalid
 	}
 	if conn.SetReadDeadline(deadline()) != nil {
@@ -362,13 +404,26 @@ func serveWithIngress(ctx context.Context, conn *net.UnixConn, config assignment
 		writeHTTP(conn, 503, "text/plain", nil)
 		return invalid
 	}
-	written, err := writeHTTP(conn, 200, "text/event-stream", result.eventStream())
-	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
+	prepared := prepareHTTP(200, "text/event-stream", result.eventStream())
+	prewriteReceipt := ""
+	if prewrite != nil {
+		prewriteReceipt, err = prewrite(requestDigest, promptDigest, prepared)
+		if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
+			writeHTTP(conn, 503, "text/plain", nil)
+			return errors.New("broker prewrite rejected")
+		}
+	}
+	// The final SSE byte may make a one-shot client exit. Its live process
+	// identity was reobserved immediately before this write; the accepted
+	// Unix connection remains bound to that peer while B records the full wire.
+	written, err := writeSuccess(conn, prepared)
+	if err != nil || ctx.Err() != nil || !relay.current() || !config.Broker.current() ||
+		(prewrite == nil && !currentPeer()) {
 		return errors.New("response write or endpoint verification failed")
 	}
 	if complete != nil {
-		if complete(requestDigest, promptDigest, written) != nil ||
-			ctx.Err() != nil || !relay.current() || !config.Broker.current() || !currentPeer() {
+		if complete(requestDigest, promptDigest, prewriteReceipt, written) != nil ||
+			ctx.Err() != nil || !relay.current() || !config.Broker.current() {
 			return errors.New("broker completion rejected")
 		}
 	}
