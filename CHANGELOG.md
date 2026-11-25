@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-11-25
+
+### Fixed
+
+- Include the Stage 2a observed local-test policy type in normal Go builds.
+  Its previous `_test.go` filename excluded it from the private arm64 bridge
+  binary even though the Go test suite passed. Production dispatch remains off.
+
 ## [0.5.11] - 2026-11-25
 
 ### Added
