@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.11] - 2026-11-25
+
+### Added
+
+- Source-only Stage 2a observed-body B route for the selected stock local test,
+  with signed FD3 and prewrite checks, exact request grammar, one peer across
+  ancillary and target requests, and completion only after the full response
+  and both ancillary requests. It remains unreachable from production dispatch.
+  The public release contains no signed B binary; private installed qualification
+  still requires matching Machine/HQ authority, selected R, and host evidence.
+
 ## [0.5.10] - 2026-11-23
 
 ### Added

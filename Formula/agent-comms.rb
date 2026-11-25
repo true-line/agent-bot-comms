@@ -13,8 +13,8 @@ class AgentComms < Formula
   homepage "https://github.com/true-line/agent-bot-comms"
   url "https://github.com/true-line/agent-bot-comms.git",
       using: :git,
-      tag:   "v0.5.10"
-  version "0.5.10"
+      tag:   "v0.5.11"
+  version "0.5.11"
   license "MIT"
 
   depends_on "node"
