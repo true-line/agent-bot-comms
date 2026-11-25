@@ -191,6 +191,10 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
       # ENG-0269: the installer runs through trueline-agent-ci's bounded
       # dependency-install action, which restores the exact lockfile-bound
       # cache and launches npm through the bounded-command runner at the same
@@ -218,6 +222,9 @@ jobs:
         run: node tools/acceptance/owner-decision-computer-use-candidate-vectors.mjs
       - name: Test
         run: npm test
+      - name: Build native Stage 2a bridge
+        working-directory: native/stage2a-bridge
+        run: go build ./...
       # ENG-0282: every first-party pin in this repository's workflows must be
       # reachable from its capability repository's default branch. The guard
       # lives in trueline-agent-ci and is fetched at the same pinned commit.

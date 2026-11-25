@@ -5,7 +5,7 @@ metadata:
   qwts-contract: "1"
   qwts-cli: "agent-comms"
   qwts-versions: ">=0.5.0 <0.6.0"
-  qwts-validated: "0.5.11"
+  qwts-validated: "0.5.12"
   qwts-side-effects: "local-write"
 ---
 
