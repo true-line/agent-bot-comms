@@ -24,6 +24,17 @@ type observedAuthorityGate interface {
 	completeObserved(context.Context, observedCompletionPayload, func() bool) error
 }
 
+const observedPostwriteWait = 10 * time.Second
+
+// A,T,B is a permitted stock order. The target response can finish before B
+// arrives, but A completion cannot be sent until that same peer's B request is
+// accepted. The assignment expiry and this shorter deadline bound the wait.
+type observedPendingCompletion struct {
+	Core     observedCompletionCore
+	Deadline time.Time
+	Ready    bool
+}
+
 func runObserved(ctx context.Context, authority observedAuthority, rawFD4 []byte,
 	status io.WriteCloser, check checkPeer, capture capturePeer) (runErr error) {
 	defer clear(rawFD4)
@@ -92,6 +103,7 @@ func runObserved(ctx context.Context, authority observedAuthority, rawFD4 []byte
 		return errors.New("observed relay readiness unavailable")
 	}
 	var sequence observedSequence
+	var pending observedPendingCompletion
 	ingressAttempted, prewriteAttempted, completionAttempted := false, false, false
 	for {
 		if ctx.Err() != nil {
@@ -99,10 +111,15 @@ func runObserved(ctx context.Context, authority observedAuthority, rawFD4 []byte
 			case <-b.dead:
 				return errors.New("observed broker disconnected")
 			default:
+				if pending.Ready {
+					return invalid
+				}
 				return nil
 			}
 		}
-		if !time.Now().Before(config.Expires) || !config.Broker.current() || !relay.current() {
+		if !time.Now().Before(config.Expires) ||
+			(pending.Ready && !time.Now().Before(pending.Deadline)) ||
+			!config.Broker.current() || !relay.current() {
 			return invalid
 		}
 		if err := listener.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
@@ -115,6 +132,9 @@ func runObserved(ctx context.Context, authority observedAuthority, rawFD4 []byte
 				case <-b.dead:
 					return errors.New("observed broker disconnected")
 				default:
+					if pending.Ready {
+						return invalid
+					}
 					return nil
 				}
 			}
@@ -136,7 +156,7 @@ func runObserved(ctx context.Context, authority observedAuthority, rawFD4 []byte
 		}
 		stopConn := context.AfterFunc(ctx, func() { conn.Close() })
 		err = serveObserved(ctx, conn, b, authority, relay, receipt, peer, capture,
-			ingressKey, completionKey, &sequence, &ingressAttempted,
+			ingressKey, completionKey, &sequence, &pending, &ingressAttempted,
 			&prewriteAttempted, &completionAttempted, writePreparedObservedHTTP)
 		stopConn()
 		conn.Close()
@@ -157,7 +177,8 @@ func observedAttemptID() (string, error) {
 func serveObserved(ctx context.Context, conn *net.UnixConn, gate observedAuthorityGate,
 	authority observedAuthority, relay endpoint, bindReceipt string,
 	peer observedPeer, capture capturePeer, ingressKey, completionKey []byte,
-	sequence *observedSequence, ingressAttempted, prewriteAttempted,
+	sequence *observedSequence, pending *observedPendingCompletion,
+	ingressAttempted, prewriteAttempted,
 	completionAttempted *bool,
 	writeSuccess func(*net.UnixConn, preparedHTTP, func() bool) (httpWrite, error)) error {
 	config := authority.FD3
@@ -166,7 +187,9 @@ func serveObserved(ctx context.Context, conn *net.UnixConn, gate observedAuthori
 			config.Broker.current() && relay.current() &&
 			observedPeerStillCurrent(conn, peer, config.RunnerUID, capture)
 	}
-	if !current() || conn.SetReadDeadline(deadline()) != nil {
+	if pending == nil || !current() ||
+		(pending.Ready && !time.Now().Before(pending.Deadline)) ||
+		conn.SetReadDeadline(deadline()) != nil {
 		return invalid
 	}
 	req, err := readRequest(conn)
@@ -189,7 +212,24 @@ func serveObserved(ctx context.Context, conn *net.UnixConn, gate observedAuthori
 		return nil
 	}
 	if inspected.Class != observedTarget {
-		writeHTTP(conn, 422, "text/plain", nil)
+		if _, err := writeHTTP(conn, 422, "text/plain", nil); err != nil {
+			return invalid
+		}
+		if pending.Ready {
+			if inspected.Class != observedAncillaryB || !sequence.complete() ||
+				!time.Now().Before(pending.Deadline) {
+				return invalid
+			}
+			currentPending := func() bool {
+				return current() && time.Now().Before(pending.Deadline)
+			}
+			if err := completeObservedRun(ctx, gate, pending.Core, completionKey,
+				completionAttempted, currentPending); err != nil {
+				return err
+			}
+			*pending = observedPendingCompletion{}
+			return nil
+		}
 		return nil
 	}
 	if *ingressAttempted {
@@ -267,13 +307,30 @@ func serveObserved(ctx context.Context, conn *net.UnixConn, gate observedAuthori
 	if err != nil {
 		return invalid
 	}
-	sealed, err := sealObservedCompletion(completion, completionKey, completionAttempted)
+	if !sequence.complete() {
+		pending.Core = completion
+		pending.Deadline = time.Now().Add(observedPostwriteWait)
+		if config.Expires.Before(pending.Deadline) {
+			pending.Deadline = config.Expires
+		}
+		pending.Ready = true
+		return nil
+	}
+	return completeObservedRun(ctx, gate, completion, completionKey,
+		completionAttempted, current)
+}
+
+func completeObservedRun(ctx context.Context, gate observedAuthorityGate,
+	core observedCompletionCore, completionKey []byte, attempted *bool,
+	current func() bool) error {
+	if gate == nil || current == nil || !current() {
+		return invalid
+	}
+	sealed, err := sealObservedCompletion(core, completionKey, attempted)
 	if err != nil {
 		return invalid
 	}
-	if gate.completeObserved(ctx, sealed, func() bool {
-		return ctx.Err() == nil && config.Broker.current() && relay.current()
-	}) != nil {
+	if gate.completeObserved(ctx, sealed, current) != nil {
 		return errors.New("observed completion acknowledgement rejected")
 	}
 	return nil

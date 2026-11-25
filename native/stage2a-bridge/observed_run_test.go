@@ -89,12 +89,13 @@ func TestObservedAncillaryRefusedLocallyBeforeBroker(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sequence observedSequence
+	var pending observedPendingCompletion
 	ingress, prewrite, complete := false, false, false
 	// nil broker proves this path performs no H call at all.
 	if err := serveObserved(context.Background(), accepted, nil, authority, relay,
 		digest([]byte("bind receipt")), peer,
 		func(*net.UnixConn) (peerProcessSnapshot, error) { return snapshot, nil },
-		nil, nil, &sequence, &ingress, &prewrite, &complete, nil); err != nil {
+		nil, nil, &sequence, &pending, &ingress, &prewrite, &complete, nil); err != nil {
 		t.Fatalf("ancillary local refusal failed: %v", err)
 	}
 	accepted.Close()
@@ -107,7 +108,7 @@ func TestObservedAncillaryRefusedLocallyBeforeBroker(t *testing.T) {
 
 func runObservedTargetRoute(t *testing.T, mode string) {
 	t.Helper()
-	authority, target, _ := observedClassificationFixture(t)
+	authority, target, ancillary := observedClassificationFixture(t)
 	selectors := observedSelectors{
 		InstallationID: "fixture.installation",
 		StartID:        "st_" + strings.Repeat("1", 24), LaunchID: "ln_" + strings.Repeat("2", 24),
@@ -180,7 +181,8 @@ func runObservedTargetRoute(t *testing.T, mode string) {
 		} else if mode == "write-failure" || mode == "stopped-before-write" ||
 			mode == "invalid-proof" || mode == "expired-proof" || mode == "wrong-core-proof" ||
 			mode == "expired-before-write" || mode == "bare-receipt" ||
-			mode == "wrong-epoch-proof" {
+			mode == "wrong-epoch-proof" || mode == "missing-second" ||
+			mode == "wrong-peer-second" || mode == "late-second" {
 			ops = ops[:2]
 		}
 		for index, op := range ops {
@@ -369,6 +371,11 @@ func runObservedTargetRoute(t *testing.T, mode string) {
 		t.Fatal(err)
 	}
 	sequence := observedSequence{ancillaryA: true}
+	if mode != "target-before-second" && mode != "missing-second" &&
+		mode != "wrong-peer-second" && mode != "late-second" {
+		sequence.ancillaryB = true
+	}
+	var pending observedPendingCompletion
 	ingressAttempted, prewriteAttempted, completionAttempted := false, false, false
 	writeSuccess := writePreparedObservedHTTP
 	if mode == "write-failure" {
@@ -385,12 +392,71 @@ func runObservedTargetRoute(t *testing.T, mode string) {
 	routeErr := serveObserved(ctx, accepted, b, authority, rEndpoint,
 		digest([]byte("bind receipt")), peer,
 		func(*net.UnixConn) (peerProcessSnapshot, error) { return snapshot, nil },
-		ingressKey, completionKey, &sequence, &ingressAttempted,
+		ingressKey, completionKey, &sequence, &pending, &ingressAttempted,
 		&prewriteAttempted, &completionAttempted, writeSuccess)
 	accepted.Close()
 	wire, err := io.ReadAll(client)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if mode == "target-before-second" || mode == "missing-second" ||
+		mode == "wrong-peer-second" || mode == "late-second" {
+		if routeErr != nil || !strings.HasPrefix(string(wire), "HTTP/1.1 200 ") ||
+			!bytes.Contains(wire, []byte("event: message_stop\n")) ||
+			!pending.Ready || !pending.Deadline.After(time.Now()) ||
+			completionAttempted || sequence.complete() {
+			t.Fatalf("target alone completed or failed: %v, %q", routeErr, wire)
+		}
+		if mode != "missing-second" {
+			if mode == "late-second" {
+				pending.Deadline = time.Now().Add(-time.Millisecond)
+			}
+			secondClient, err := net.DialUnix("unix", nil, rListener.Addr().(*net.UnixAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondClient.SetDeadline(time.Now().Add(5 * time.Second))
+			secondConn, err := rListener.AcceptUnix()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := secondClient.Write(observedRawRequest(
+				authority.FD3.LocalTest.AncillaryProfile.SecondHeaderShape.RequiredFixed,
+				ancillary)); err != nil {
+				t.Fatal(err)
+			}
+			secondSnapshot := snapshot
+			if mode == "wrong-peer-second" {
+				secondSnapshot.Peer.PID++
+				secondSnapshot.Peer.PIDVersion++
+			}
+			secondPeer, err := observedPeerFromSnapshot(secondSnapshot, 303)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondErr := serveObserved(ctx, secondConn, b, authority, rEndpoint,
+				digest([]byte("bind receipt")), secondPeer,
+				func(*net.UnixConn) (peerProcessSnapshot, error) { return secondSnapshot, nil },
+				ingressKey, completionKey, &sequence, &pending, &ingressAttempted,
+				&prewriteAttempted, &completionAttempted, writePreparedObservedHTTP)
+			secondConn.Close()
+			secondWire, err := io.ReadAll(secondClient)
+			secondClient.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "target-before-second" {
+				if secondErr != nil || !strings.HasPrefix(string(secondWire), "HTTP/1.1 422 ") ||
+					!completionAttempted || !sequence.complete() || pending.Ready {
+					t.Fatalf("valid postwrite second did not complete: %v, %q", secondErr, secondWire)
+				}
+			} else if completionAttempted || sequence.complete() ||
+				(mode == "wrong-peer-second" &&
+					(secondErr != nil || !strings.HasPrefix(string(secondWire), "HTTP/1.1 422 "))) ||
+				(mode == "late-second" && secondErr == nil) {
+				t.Fatalf("invalid postwrite second completed: %v, %q", secondErr, secondWire)
+			}
+		}
 	}
 	switch mode {
 	case "valid":
@@ -420,6 +486,11 @@ func runObservedTargetRoute(t *testing.T, mode string) {
 		if routeErr == nil || !strings.HasPrefix(string(wire), "HTTP/1.1 200 ") ||
 			!ingressAttempted || !prewriteAttempted || !completionAttempted {
 			t.Fatalf("bad completion ack handling: %v, %q", routeErr, wire)
+		}
+	case "target-before-second", "missing-second", "wrong-peer-second", "late-second":
+		if !ingressAttempted || !prewriteAttempted ||
+			completionAttempted != (mode == "target-before-second") {
+			t.Fatalf("postwrite completion attempt mismatch: %s", mode)
 		}
 	}
 	if err := <-hDone; err != nil {
@@ -474,4 +545,20 @@ func TestObservedStoppedBrokerCannotStartSSE(t *testing.T) {
 
 func TestObservedBadCompletionAckCannotQualify(t *testing.T) {
 	runObservedTargetRoute(t, "bad-ack")
+}
+
+func TestObservedTargetBeforeSecondCompletesAfterSamePeerSecond(t *testing.T) {
+	runObservedTargetRoute(t, "target-before-second")
+}
+
+func TestObservedTargetWithoutSecondCannotComplete(t *testing.T) {
+	runObservedTargetRoute(t, "missing-second")
+}
+
+func TestObservedWrongPeerSecondCannotComplete(t *testing.T) {
+	runObservedTargetRoute(t, "wrong-peer-second")
+}
+
+func TestObservedLateSecondCannotComplete(t *testing.T) {
+	runObservedTargetRoute(t, "late-second")
 }
