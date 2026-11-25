@@ -319,11 +319,11 @@ func (b *broker) call(ctx context.Context, id, op string, payload, out any) erro
 	}
 	timeout := ioTimeout
 	switch op {
-	case relayIngressOp, "bridge.member-policy.v3", "bridge.ready.cooperative.v3":
+	case relayIngressOp, observedIngressOp, "bridge.member-policy.v3", "bridge.ready.cooperative.v3":
 		timeout = relayIngressTimeout
-	case relayPrewriteOp:
+	case relayPrewriteOp, observedPrewriteOp:
 		timeout = relayPrewriteTimeout
-	case relayCompletionOp:
+	case relayCompletionOp, observedCompleteOp:
 		timeout = relayCompletionTimeout
 	}
 	timer := time.NewTimer(timeout)
